@@ -34,7 +34,8 @@ class NTXentLoss(nn.Module):
         
         # 4. Masking diagonal utama (menghilangkan similarity dengan diri sendiri)
         mask = torch.eye(2 * current_batch_size, dtype=torch.bool, device=device)
-        similarity_matrix = similarity_matrix.masked_fill(mask, -9e15)
+        min_val = torch.finfo(similarity_matrix.dtype).min
+        similarity_matrix = similarity_matrix.masked_fill(mask, min_val)
         
         # 5. Buat target labels
         # Sampel ke-i (dari z_i) punya pasangan positif di indeks (i + batch_size) (yaitu z_j)
