@@ -37,14 +37,21 @@ class FilamentMask2Former(nn.Module):
     Model segmentasi filamen matahari — SolarSimCLR backbone + Mask2Former decoder.
 
     ──────────────────────────────────────────────────────────────
-    Alur Data & Patch Arsitektur (FIX BUG-04)
+    Alur Data & Patch Arsitektur (Dynamic Shape Inference)
     ──────────────────────────────────────────────────────────────
-    SolarSimCLR (ResNet50, 1-channel) menghasilkan 5 feature maps:
-        x0: [B, 64, H/2,  W/2]   (post-conv1, sebelum layer1)
-        c1: [B, 256, H/4,  W/4]   (layer1)
-        c2: [B, 512, H/8,  W/8]   (layer2)
-        c3: [B, 1024, H/16, W/16]  (layer3)
-        c4: [B, 2048, H/32, W/32]  (layer4)
+    Model ini menggunakan arsitektur agnostik yang secara otomatis mengukur 
+    dan beradaptasi dengan dimensi matriks dari backbone apa pun (misal: ResNet34, ResNet50).
+    
+    SolarSimCLR menghasilkan 5 feature maps:
+        x0: [B, C0, H/2,  W/2]   (post-conv1, sebelum layer1)
+        c1: [B, C1, H/4,  W/4]   (layer1)
+        c2: [B, C2, H/8,  W/8]   (layer2)
+        c3: [B, C3, H/16, W/16]  (layer3)
+        c4: [B, C4, H/32, W/32]  (layer4)
+        
+        *Catatan Dimensi (C): 
+         - ResNet34: C1=64, C2=128, C3=256, C4=512
+         - ResNet50: C1=256, C2=512, C3=1024, C4=2048
 
     Kita kirim 4 fitur ke DummyEncoder dalam urutan fine→coarse:
         feature_maps = (c1, c2, c3, c4)
@@ -53,27 +60,38 @@ class FilamentMask2Former(nn.Module):
 
         1) input_projections → `features[::-1][:num_feature_levels]`
            Dengan num_feature_levels=3, fitur yang diproses (setelah pembalikan):
-               level=0 ← c4 (2048ch)   → patch Conv2d(2048→256)
-               level=1 ← c3 (1024ch)   → patch Conv2d(1024→256)
-               level=2 ← c2 (512ch)    → patch Conv2d(512→256)
+               level=0 ← c4 (terdalam) → patch Conv2d(C4 → 256)
+               level=1 ← c3            → patch Conv2d(C3 → 256)
+               level=2 ← c2            → patch Conv2d(C2 → 256)
 
         2) lateral_convolutions → `features[:num_fpn_levels][::-1]`
            Dengan num_fpn_levels=1, fitur yang diproses:
-               idx=0 ← c1 (256ch)     → patch Conv2d(256→256)
+               idx=0 ← c1 (terdangkal) → patch Conv2d(C1 → 256)
 
     Dengan kata lain, pengiriman (c1, c2, c3, c4) fine→coarse memastikan:
         - c4 menjadi features[-1] → diambil pertama setelah [::-1]
         - c1 menjadi features[0]  → diambil untuk FPN lateral
+        
+    Kapasitas saluran (channels) diukur secara otomatis saat inisialisasi awal 
+    menggunakan tensor dummy, menghilangkan kebutuhan hardcode matriks dimensi.
     """
 
-    # Channel ResNet50 per stage: c1(256), c2(512), c3(1024), c4(2048)
-    BACKBONE_CHANNELS = [256, 512, 1024, 2048]
-
-    def __init__(self, num_classes=1):
+    def __init__(self, num_classes=4, base_model='resnet34'):
         super().__init__()
 
-        # 1. Backbone SolarSimCLR (menggantikan encoder bawaan)
-        self.backbone = SolarSimCLR()
+        # 1. Backbone SolarSimCLR (terima parameter nama model)
+        self.backbone = SolarSimCLR(base_model=base_model)
+        
+        # --- [ADAPTASI OTOMATIS: Dynamic Shape Inference] ---
+        dummy_x = torch.randn(1, 1, 256, 256)
+        self.backbone.eval()
+        with torch.no_grad():
+            _, features = self.backbone(dummy_x)
+        
+        # features = [x0, c1, c2, c3, c4]. Kita ukur channel (dimensi ke-1) dari c1-c4.
+        self.BACKBONE_CHANNELS = [f.shape[1] for f in features[1:]]
+        self.backbone.train()
+        # ----------------------------------------------------
 
         # 2. Konfigurasi Mask2Former tanpa backbone bawaan
         config = Mask2FormerConfig(
@@ -82,6 +100,13 @@ class FilamentMask2Former(nn.Module):
             use_pretrained_backbone=False,
         )
         self.mask2former = Mask2FormerForUniversalSegmentation(config)
+
+        # 3. Patch konvolusi (fungsi ini kini akan menggunakan BACKBONE_CHANNELS dinamis)
+        self._patch_pixel_decoder_projections()
+        
+        # 4. Pasang DummyEncoder
+        self.dummy_encoder = DummyEncoder()
+        self.mask2former.model.pixel_level_module.encoder = self.dummy_encoder
 
         # 3. FIX BUG-04: Patch seluruh konvolusi proyeksi di PixelDecoder
         #
@@ -192,7 +217,7 @@ class FilamentMask2Former(nn.Module):
 
 if __name__ == "__main__":
     print("Inisialisasi FilamentMask2Former...")
-    model = FilamentMask2Former(num_classes=1)
+    model = FilamentMask2Former(num_classes=4)
 
     x = torch.randn(1, 1, 256, 256)
     print(f"Forward pass dengan input shape: {x.shape}...")

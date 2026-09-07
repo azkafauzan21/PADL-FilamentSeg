@@ -2,6 +2,7 @@ import os
 
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -162,6 +163,7 @@ def run_validation(
                 size=(target_h, target_w), 
                 mode="bilinear", 
                 align_corners=False
+            )
 
             batch_size = images.shape[0]
             for b in range(batch_size):
@@ -216,8 +218,8 @@ def train_mask2former_routine(config):
     # ------------------------------------------------------------------
     # Inisialisasi Model
     # ------------------------------------------------------------------
-    print("[INFO] Initializing FilamentMask2Former model...")
-    model = FilamentMask2Former(num_classes=4)
+    print(f"[INFO] Initializing FilamentMask2Former model (Backbone: {config.ssl_training.backbone})...")
+    model = FilamentMask2Former(num_classes=4, base_model=config.ssl_training.backbone)
 
     # ------------------------------------------------------------------
     # Muat bobot backbone SimCLR dari Tahap 1

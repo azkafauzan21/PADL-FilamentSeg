@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torchvision.models import resnet50, resnet18
+from torchvision.models import resnet50, resnet34, resnet18
 
 class SolarSimCLR(nn.Module):
     def __init__(self, base_model='resnet50', latent_dim=128):
@@ -9,6 +9,9 @@ class SolarSimCLR(nn.Module):
         # Muat backbone (tanpa bobot pre-trained karena kita latih dari awal/domain berbeda)
         if base_model == 'resnet18':
             base_network = resnet18(weights=None)
+            proj_in_dim = 512
+        elif base_model == 'resnet34':
+            base_network = resnet34(weights=None)
             proj_in_dim = 512
         else:
             base_network = resnet50(weights=None)

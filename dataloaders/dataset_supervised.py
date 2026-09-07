@@ -31,7 +31,7 @@ class FilamentSupervisedDataset(Dataset):
 
     def __getitem__(self, idx):
         img_id = self.image_ids[idx]
-        img_metadata = self.coco.loadImgs(img_id)[0]
+        img_metadata = self.coco.loadImgs([img_id])[0]
         
         # 1. Pemuatan Citra 8-bit JPEG
         path = os.path.join(self.image_dir, img_metadata['file_name'])
@@ -52,7 +52,7 @@ class FilamentSupervisedDataset(Dataset):
         image = (image - p1) / (p99 - p1 + 1e-8)
         
         # 2. Penarikan Mask (Instances) via COCO
-        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        ann_ids = self.coco.getAnnIds(imgIds=[img_id])
         annotations = self.coco.loadAnns(ann_ids)
         
         masks = []
@@ -61,7 +61,7 @@ class FilamentSupervisedDataset(Dataset):
             # Otomatis decode RLE / Polygon dari JSON menjadi numpy boolean array 2D
             mask = self.coco.annToMask(ann)
             masks.append(mask)
-            class_labels_list.append(ann['category_id'])
+            class_labels_list.append(ann['category_id'] - 1)
             
         # 3. Transformasi Augmentasi (Bebas dari Larangan No RandomFlip jika mau)
         # Pada data JPEG H-Alpha Kaggle, orientasi seringkali standar (utara di atas),
@@ -70,7 +70,18 @@ class FilamentSupervisedDataset(Dataset):
             if len(masks) > 0:
                 augmented = self.transform(image=image, masks=masks)
                 image = augmented['image']
-                masks = augmented['masks']
+                aug_masks = augmented['masks']
+
+                valid_masks = []
+                valid_labels = []
+                for m, label in zip(aug_masks, class_labels_list):
+                    m_bin = (m > 0).astype(np.uint8)  # Binarisasi ketat
+                    if m_bin.sum() > 0:               # Filter ghost mask
+                        valid_masks.append(m_bin)
+                        valid_labels.append(label)
+
+                masks = valid_masks
+                class_labels_list = valid_labels
             else:
                 augmented = self.transform(image=image)
                 image = augmented['image']
