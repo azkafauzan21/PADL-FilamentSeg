@@ -30,5 +30,5 @@ def get_supervised_transform(config):
     """
     sup_conf = config.data_augmentation.supervised
     return A.Compose([
-        A.Resize(size=(sup_conf.resize_dim, sup_conf.resize_dim))
+        A.Resize(height=sup_conf.resize_dim, width=sup_conf.resize_dim)
     ])

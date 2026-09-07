@@ -153,6 +153,15 @@ def run_validation(
 
             mask_logits, _class_logits = model(pixel_values=images)
             # mask_logits: [B, Q, H, W]
+            
+            target_h, target_w = targets[0]["mask_labels"].shape[-2:]
+        
+            # Upsample prediksi kembali ke ukuran asli (misal: 256 -> 1024)
+            mask_logits = F.interpolate(
+                mask_logits, 
+                size=(target_h, target_w), 
+                mode="bilinear", 
+                align_corners=False
 
             batch_size = images.shape[0]
             for b in range(batch_size):
@@ -208,7 +217,7 @@ def train_mask2former_routine(config):
     # Inisialisasi Model
     # ------------------------------------------------------------------
     print("[INFO] Initializing FilamentMask2Former model...")
-    model = FilamentMask2Former(num_classes=1)
+    model = FilamentMask2Former(num_classes=4)
 
     # ------------------------------------------------------------------
     # Muat bobot backbone SimCLR dari Tahap 1
@@ -298,7 +307,7 @@ def train_mask2former_routine(config):
     # ------------------------------------------------------------------
     try:
         from torchmetrics.segmentation import DiceScore
-        dice_metric = DiceScore(num_classes=2, average="macro").to(device)
+        dice_metric = DiceScore(num_classes=4, average="macro").to(device)
         use_metrics = True
         print("[INFO] torchmetrics DiceScore: AKTIF")
     except ImportError:

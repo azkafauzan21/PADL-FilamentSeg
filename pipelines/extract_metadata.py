@@ -104,6 +104,7 @@ def extract_data_routine(config):
 
     df_targets = pd.DataFrame(fits_targets)
     targets_csv_path = os.path.join(config.system.data_dir, "download_fits_targets.csv")
+    os.makedirs(config.system.data_dir, exist_ok=True)
     df_targets.to_csv(targets_csv_path, index=False)
 
     # Laporan distribusi stasiun dan tahun
