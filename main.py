@@ -8,6 +8,7 @@ import random
 from omegaconf import OmegaConf
 
 from pipelines.extract_metadata import extract_data_routine
+from pipelines.preprocess import preprocess_routine
 from pipelines.train_simclr import train_simclr_routine
 from pipelines.train_mask2former import train_mask2former_routine
 from pipelines.generate_submission import inference_routine
@@ -27,11 +28,18 @@ def parse_args():
         "--mode",
         type=str,
         required=True,
-        choices=["extract_metadata", "train_simclr", "train_mask2former", "generate_submission"],
+        choices=[
+            "extract_metadata",
+            "preprocess",
+            "train_simclr",
+            "train_mask2former",
+            "generate_submission",
+        ],
         help=(
             "Tentukan fase spesifik pipeline yang akan dieksekusi:\n"
             "  extract_metadata    — Parse COCO JSON, buat anti-leakage train/val split\n"
-            "  train_simclr        — Tahap 1: SSL pre-training pada data FITS\n"
+            "  preprocess          — Konversi FITS 2048×2048 → NPY 512×512 (wajib sebelum train_simclr)\n"
+            "  train_simclr        — Tahap 1: SSL pre-training pada data NPY\n"
             "  train_mask2former   — Tahap 2: Supervised fine-tuning pada data JPEG+COCO\n"
             "  generate_submission — Tahap 3: Inferensi dan pembuatan submission CSV"
         ),
@@ -199,6 +207,8 @@ def main():
 
     if args.mode == "extract_metadata":
         extract_data_routine(config)
+    elif args.mode == "preprocess":
+        preprocess_routine(config)
     elif args.mode == "train_simclr":
         train_simclr_routine(config)
     elif args.mode == "train_mask2former":

@@ -1,6 +1,6 @@
 # PADL-FilamentSeg
 
-**Physics-Aware Deep Learning for Solar Filament Segmentation**
+**Physics-Aware Deep Learning for Solar Filament Segmentation**  
 *MAGFiLO 1.0 Kaggle 2026 Competition Repository*
 
 ---
@@ -21,13 +21,23 @@
 
 ### 1.1 Dual-Pipeline Design
 
-PADL-FilamentSeg implements a **sequential two-stage pipeline** that bridges unsupervised heliophysical representation learning with supervised instance segmentation.
+PADL-FilamentSeg implements a **sequential three-stage pipeline** that bridges unsupervised heliophysical representation learning with supervised instance segmentation, with an intermediate pre-processing step to resolve I/O bottlenecks from massive FITS files.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
+│  PRE-PROCESSING — FITS → NPY Conversion (preprocess.py)                 │
+│                                                                         │
+│  Input : *.fits (16/32-bit, 2048×2048, from GONG network)              │
+│  Ops   : AstropyWarning catch (corrupt skip) → NaN/Inf → 0.0 →         │
+│          cv2.INTER_AREA downsample → float32 .npy                       │
+│  Output: data/processed/fits/{train,test}/*.npy  (512×512, ~1 MB/file) │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
 │  STAGE 1 — Self-Supervised Pre-training (SimCLR)                        │
 │                                                                         │
-│  Input : FITS files (16/32-bit float, 1-channel, from GONG network)     │
+│  Input : NPY files (float32, 512×512, 1-channel)                        │
 │  Model : SolarSimCLR  (ResNet50 with 1-channel conv1 override)          │
 │  Loss  : NT-Xent Contrastive Loss                                       │
 │  Output: simclr_final.pth  (backbone weights encoding plasma physics)   │
@@ -52,11 +62,13 @@ PADL-FilamentSeg implements a **sequential two-stage pipeline** that bridges uns
 
 JPEG images distributed in Kaggle competition datasets are compressed to **8-bit**, which irreversibly destroys subtle intensity gradients critical for distinguishing filament optical depth and plasma density. GONG network FITS files, by contrast, encode the **true thermodynamic dynamic range** of the solar chromosphere in 16-bit or 32-bit floating-point.
 
-By pre-training SimCLR directly on raw FITS matrices, the backbone learns to detect pixel intensity fluctuations that represent genuine physical energy quantities — not display-optimized pixel values. This gives the model an intrinsic understanding of:
+By pre-training SimCLR on FITS-derived NPY matrices, the backbone learns to detect pixel intensity fluctuations that represent genuine physical energy quantities — not display-optimized pixel values. This gives the model an intrinsic understanding of:
 
 - **Plasma density gradients** encoded in H-alpha absorption strength
 - **Thermal topology** of quiescent filament channels vs. surrounding chromospheric network
 - **Limb darkening** as an atmospheric effect to discount — not a signal to segment
+
+The FITS files are pre-processed offline to NPY format (512×512) using `cv2.INTER_AREA` downsampling, which preserves the **spatial flux ratio** between pixels by computing the true average over each 4×4 source region. This is physically correct: it is equivalent to integrating the H-alpha emission over a coarser spatial resolution, not interpolating pixel values.
 
 The NT-Xent loss then acts as a **plasma distribution capture mechanism**: it forces the latent space to cluster representations of filament structures with identical thermodynamic topology even under extreme observational flux variation (e.g., equatorial vs. limb-darkened filaments), reducing sensitivity to instrument flux artifacts while preserving morphological invariants.
 
@@ -73,20 +85,25 @@ PADL-FilamentSeg/
 ├── data/
 │   ├── raw/
 │   │   ├── fits/
-│   │   │   ├── train/          ← ✅ ONLY source for SSL pre-training
-│   │   │   │   └── *.fits
-│   │   │   └── test/           ← 🚫 STRICTLY OFF-LIMITS (180 FITS files)
-│   │   │       └── *.fits
+│   │   │   ├── train/          ← ✅ Input for preprocess (Stage 0a)
+│   │   │   │   └── *.fits      ← Ribuan file FITS mentah 2048×2048
+│   │   │   └── test/           ← ✅ Input for preprocess (Stage 0a)
+│   │   │       └── *.fits      ← 180 file FITS (tidak boleh masuk SSL)
 │   │   └── MAGFiLO_1.0_Kaggle_2026/
 │   │       ├── train/
-│   │       │   ├── train_images/    ← JPEG labeled images for Stage 2
-│   │       │   └── MAGFiLO_1.0_Annotations_kaggle2026_train.json
+│   │       │   ├── train_images/    ← 707 JPEG berlabel untuk Stage 2
+│   │       │   └── MAGFiLO_1.0_Annotations_kaggle2026_train.json  (46.4 MB)
 │   │       └── test/
-│   │           └── test_images/     ← Unlabeled JPEG for inference only
+│   │           └── test_images/    ← 180 JPEG unlabeled untuk inferensi
+│   ├── processed/
+│   │   └── fits/
+│   │       ├── train/          ← ✅ Auto-generated oleh preprocess (Stage 0b)
+│   │       │   └── *.npy       ← float32, 512×512, siap untuk SSL
+│   │       └── test/           ← ✅ Auto-generated oleh preprocess (Stage 0b)
+│   │           └── *.npy
 │   ├── train_split.json        ← Auto-generated by extract_metadata (80%)
 │   ├── val_split.json          ← Auto-generated by extract_metadata (20%)
-│   ├── download_fits_targets.csv
-│   └── submission.csv          ← Final output of generate_submission
+│   └── download_fits_targets.csv
 ├── weights/
 │   ├── simclr_final.pth
 │   ├── best_mask2former.pth    ← Smart checkpoint (highest val PQ)
@@ -94,6 +111,8 @@ PADL-FilamentSeg/
 ├── runs/                       ← TensorBoard logs (auto-created)
 │   ├── simclr/
 │   └── mask2former/
+├── data/
+│   └── submission.csv          ← Final output of generate_submission
 ├── config.yaml
 └── main.py
 ```
@@ -102,9 +121,11 @@ PADL-FilamentSeg/
 
 | Rule | Description |
 |---|---|
-| **FITS Test Isolation** | `data/raw/fits/test/` is **absolutely off-limits** to any training pipeline. The SSL dataloader uses a non-recursive glob on `fits_train_dir` and performs a path guard to raise `RuntimeError` if any `/test/` path contaminates the batch. |
-| **JPEG Test Purity** | `test_images/` contains **only unlabeled images**. The inference pipeline reads exclusively from `jpeg_test_dir` and accepts only `.jpg/.jpeg/.png` extensions — FITS files physically cannot be loaded by `cv2.imread`. |
+| **NPY Test Isolation** | `data/processed/fits/test/` is **absolutely off-limits** to the SSL training pipeline. The SSL dataloader uses a non-recursive glob on `npy_train_dir` and performs a path guard to raise `RuntimeError` if any `/test/` path contaminates the batch. |
+| **FITS → NPY Pipeline** | Raw FITS files are **never read directly** during training. All I/O during SSL goes through pre-processed NPY files. This eliminates the astropy decompression bottleneck from the GPU-bound training loop. |
+| **JPEG Test Purity** | `test_images/` contains **only unlabeled images**. The inference pipeline reads exclusively from `jpeg_test_dir` and accepts only `.jpg/.jpeg/.png` extensions. |
 | **Anti-Leakage Split** | `extract_metadata` splits by unique `file_name` (physical file), not `image_id`. One physical solar observation can have multiple annotation instances; splitting by `image_id` alone would allow the same physical image to appear in both train and validation sets. |
+| **Temporal Stratification** | The train/val split is stratified by **observation year** (4-digit prefix of timestamp). This guarantees that each year of the Solar Cycle 24–25 dataset (2011–2022) is proportionally represented in both partitions, preventing temporal bias. |
 
 ---
 
@@ -134,11 +155,11 @@ pip install tensorboard
 | `torch>=2.0.0`, `torchvision` | Core deep learning framework |
 | `transformers` | Hugging Face Mask2Former implementation |
 | `pycocotools` | RLE encoding/decoding for masks |
-| `astropy`, `sunpy` | FITS file I/O and solar data handling |
+| `astropy`, `sunpy` | FITS file I/O (used only in `preprocess.py`, not in training) |
+| `opencv-python` | INTER_AREA downsampling in preprocess + JPEG loading in inference |
 | `albumentations` | Physics-aware augmentation pipeline |
-| `opencv-python` | JPEG image loading in inference |
 | `omegaconf` | YAML configuration management |
-| `scikit-learn` | Anti-leakage train/val splitting |
+| `scikit-learn` | Anti-leakage train/val splitting with temporal stratification |
 | `pandas`, `numpy` | Data manipulation and array ops |
 | `tqdm` | Training progress bars |
 
@@ -156,10 +177,19 @@ system:
   data_dir: "./data"
   weights_dir: "./weights"
 
-  # --- Explicit data paths (do not use relative construction elsewhere) ---
+  # --- Raw FITS paths (input for preprocess.py only) ---
   fits_train_dir: "./data/raw/fits/train"
+  fits_test_dir:  "./data/raw/fits/test"
+
+  # --- Pre-processed NPY paths (output of preprocess, input for train_simclr) ---
+  npy_train_dir:  "./data/processed/fits/train"
+  npy_test_dir:   "./data/processed/fits/test"
+
+  # --- JPEG paths for supervised training and inference ---
   jpeg_train_dir: "./data/raw/MAGFiLO_1.0_Kaggle_2026/train/train_images"
   jpeg_test_dir:  "./data/raw/MAGFiLO_1.0_Kaggle_2026/test/test_images"
+
+  # --- COCO annotation paths ---
   coco_annotation_path: "./data/raw/MAGFiLO_1.0_Kaggle_2026/train/MAGFiLO_1.0_Annotations_kaggle2026_train.json"
   train_split_json: "./data/train_split.json"
   val_split_json:   "./data/val_split.json"
@@ -188,7 +218,9 @@ supervised_training:
 
 **Key configuration notes:**
 
-- **`percentile_clip_lower/upper`**: Standard astronomical curation technique. Clips intensity outliers caused by cosmic rays and impulsive solar flare emission — ensures the neural network allocates representational capacity only to the stable thermodynamic range of filament structures.
+- **`fits_train_dir` / `fits_test_dir`**: Used exclusively by `preprocess.py`. After preprocessing is done, these paths are no longer read by any training pipeline.
+- **`npy_train_dir`**: The **only** data source for `train_simclr`. Populated by running `--mode preprocess`.
+- **`percentile_clip_lower/upper`**: Standard astronomical curation technique. Clips intensity outliers caused by cosmic rays and impulsive solar flare emission.
 - **`freeze_backbone_epochs`**: During the first N epochs of Stage 2, the ResNet backbone is frozen. Only the Pixel Decoder and Transformer Decoder are trained. After epoch N, the backbone is unfrozen with a 10× lower learning rate (differential LR) to prevent catastrophic forgetting of SSL representations.
 - **`temperature`**: NT-Xent temperature. Lower values create sharper contrastive distributions; `0.1` is empirically stable for solar imagery.
 
@@ -199,7 +231,7 @@ supervised_training:
 All pipeline stages are executed through a **single entry point**: `main.py`.
 
 ```
-usage: main.py [-h] --mode {extract_metadata,train_simclr,train_mask2former,generate_submission}
+usage: main.py [-h] --mode {extract_metadata,preprocess,train_simclr,train_mask2former,generate_submission}
                [--config CONFIG]
                [--workers N] [--batch_size N] [--epochs N] [--lr LR]
 
@@ -208,7 +240,8 @@ PADL-FilamentSeg: Physics-Aware Deep Learning for Solar Filaments
 required arguments:
   --mode        Pipeline stage to execute. One of:
                   extract_metadata    — Parse COCO JSON, create anti-leakage train/val split
-                  train_simclr        — Stage 1: SSL pre-training on FITS data
+                  preprocess          — Convert FITS 2048×2048 → NPY 512×512 (run before train_simclr)
+                  train_simclr        — Stage 1: SSL pre-training on pre-processed NPY data
                   train_mask2former   — Stage 2: Supervised fine-tuning on JPEG+COCO data
                   generate_submission — Stage 3: Inference and submission CSV generation
 
@@ -233,7 +266,7 @@ The flat CLI flags `--batch_size`, `--epochs`, and `--lr` are **mode-aware**: `m
 
 ---
 
-### Stage 0 — Extract Metadata & Build Splits
+### Stage 0a — Extract Metadata & Build Splits
 
 Parse the Kaggle COCO annotation JSON, generate FITS download targets, and create anti-leakage train/val split files. **Must be run once before any training stage.**
 
@@ -241,18 +274,59 @@ Parse the Kaggle COCO annotation JSON, generate FITS download targets, and creat
 python main.py --mode extract_metadata
 ```
 
+**What happens internally:**
+1. Parses `MAGFiLO_1.0_Annotations_kaggle2026_train.json`.
+2. Extracts timestamp and GONG station code from each `file_name` via regex `(\d{14})` and `([A-Z])h\.`.
+3. Builds `download_fits_targets.csv` with columns `file_name`, `timestamp`, `year`, `station_code`.
+4. Splits images 80/20 using `sklearn.train_test_split` with **temporal stratification** by `year` — ensuring every observation year is proportionally represented in both partitions.
+5. Writes COCO-format subset JSONs for each partition.
+
 **Outputs generated:**
 ```
-data/download_fits_targets.csv   # FITS download target list for SSL (station + timestamp)
-data/train_split.json            # 80% of images → training set (COCO subset)
-data/val_split.json              # 20% of images → validation set (COCO subset)
+data/download_fits_targets.csv   # FITS download target list (with station code + year)
+data/train_split.json            # 80% of images → training set (COCO subset, year-stratified)
+data/val_split.json              # 20% of images → validation set (COCO subset, year-stratified)
+```
+
+---
+
+### Stage 0b — Pre-process FITS → NPY
+
+Convert raw FITS files to lightweight, training-ready NPY arrays. **Must be run before `train_simclr`.**
+
+```bash
+python main.py --mode preprocess
+```
+
+This step is intentionally decoupled from training to eliminate I/O bottlenecks. `astropy.io.fits` decompression and FITS header parsing are expensive operations — running them inside the GPU-bound training loop creates severe CPU/GPU starvation. Pre-processing amortizes this cost to a one-time offline job.
+
+**What happens internally:**
+1. Scans all `*.fits` files in `fits_train_dir` and `fits_test_dir`.
+2. Opens each file with `astropy.io.fits`. If `AstropyWarning` is raised (truncated / corrupt file), the file is **silently skipped** and logged.
+3. Replaces all `NaN` and `Inf` values with `0.0`.
+4. Downsamples `2048×2048 → 512×512` using **`cv2.INTER_AREA`** (area-weighted average — spatially conservative for H-alpha flux data).
+5. Saves as `float32` `.npy` to the mirrored directory structure under `data/processed/fits/`.
+6. **Idempotent**: already-converted files are skipped on re-runs.
+
+> **Known anomaly handled:** The file `data/raw/fits/train/20110126130634Ch.fits` (~712 KB vs. ~2.6 MB typical) was identified during the 2026-09-07 audit as a likely corrupt or truncated file. This file will trigger an `AstropyWarning` and be automatically skipped by the pre-processor.
+
+**Outputs generated:**
+```
+data/processed/fits/train/*.npy   # float32, 512×512 — input for train_simclr
+data/processed/fits/test/*.npy    # float32, 512×512 — available for analysis
+```
+
+**Standalone invocation (optional):**
+```bash
+# Can also be run directly without going through main.py
+python pipelines/preprocess.py --config config.yaml
 ```
 
 ---
 
 ### Stage 1 — SimCLR Self-Supervised Pre-training
 
-Train the solar physics backbone on raw FITS images using contrastive learning. No labels required.
+Train the solar physics backbone on pre-processed NPY images using contrastive learning. No labels required.
 
 ```bash
 # Default: menggunakan seluruh nilai dari config.yaml
@@ -269,10 +343,12 @@ python main.py --mode train_simclr --config config_v2.yaml --lr=0.0003
 ```
 
 **What happens internally:**
-1. Loads all `*.fits` files from `fits_train_dir` (non-recursive, test partition guarded).
-2. Applies physics-aware augmentation (no flip, percentile normalization, contrast jitter, blur).
+1. Loads all `*.npy` files from `npy_train_dir` (non-recursive, test partition guarded).
+2. Applies physics-aware augmentation (no flip, percentile normalization, contrast jitter, blur) via `albumentations`.
 3. Trains `SolarSimCLR` (ResNet50, 1-channel input) with NT-Xent loss for `ssl_training.epochs` epochs.
 4. Saves a per-epoch checkpoint and a final weight file.
+
+> **Note:** `train_simclr` reads `*.npy` via `np.load()` — O(1) I/O with no decompression overhead. This replaces the previous `astropy.io.fits` path that caused training throughput bottlenecks.
 
 **Outputs:**
 ```
@@ -342,10 +418,13 @@ data/submission.csv
 ### Complete End-to-End Execution Sequence
 
 ```bash
-# Step 0: Parse COCO annotations and create train/val splits
+# Step 0a: Parse COCO annotations and create year-stratified train/val splits
 python main.py --mode extract_metadata
 
-# Step 1: Pre-train physics backbone on FITS data (GPU recommended)
+# Step 0b: Convert raw FITS 2048×2048 → NPY 512×512 (one-time offline job)
+python main.py --mode preprocess
+
+# Step 1: Pre-train physics backbone on NPY data (GPU recommended)
 python main.py --mode train_simclr
 
 # Step 2: Fine-tune segmentation model on labeled JPEG data
@@ -354,6 +433,8 @@ python main.py --mode train_mask2former
 # Step 3: Generate Kaggle submission CSV
 python main.py --mode generate_submission
 ```
+
+> **Checkpoint note:** Steps 0a and 0b only need to be run **once** per dataset. They are fully idempotent — re-running them will not overwrite existing NPY files or regenerate splits with a different random state (as long as `config.system.seed` is unchanged).
 
 ---
 
@@ -372,10 +453,10 @@ The inference pipeline produces `data/submission.csv` strictly conforming to the
 
 ```
 filament_id,segmentation_rle
-20120506124500_ha_ma_1,56 3 120 5 188 7 ...
-20120506124500_ha_ma_2,892 2 961 4 1029 6 ...
-20120507083200_ha_ud_1,234 8 302 10 370 12 ...
-20120507093100_ha_bb_0,
+20120506124500Ch_1,56 3 120 5 188 7 ...
+20120506124500Ch_2,892 2 961 4 1029 6 ...
+20120507083200Lh_1,234 8 302 10 370 12 ...
+20120507093100Bh_0,
 ```
 
 **Format guarantees:**
@@ -447,6 +528,8 @@ set_seed(seed=42)
 ```
 
 This freezes: Python `random`, NumPy, PyTorch CPU/CUDA seeds, CuDNN deterministic mode, and `PYTHONHASHSEED`. To reproduce a specific run, ensure `config.system.seed` is set identically and `fp16_precision` matches your hardware configuration.
+
+The temporal stratification in `extract_metadata` is also deterministic: `sklearn.train_test_split` receives `random_state=config.system.seed`, which is initialized **before** `extract_data_routine` is called from `main.py`.
 
 > **Note on CuDNN determinism:** Setting `torch.backends.cudnn.deterministic = True` may reduce throughput on some GPU architectures. Set `fp16_precision: false` if you encounter non-deterministic behavior with AMP enabled.
 

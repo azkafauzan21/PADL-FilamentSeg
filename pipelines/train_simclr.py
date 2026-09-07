@@ -65,26 +65,34 @@ def train_simclr_routine(config):
         print("[INFO] Automatic Mixed Precision (AMP - fp16) ENABLED.")
 
     # ------------------------------------------------------------------
-    # FIX BUG-01: Gunakan config.system.fits_train_dir (bukan konstruksi
-    # salah os.path.join(data_dir, "fits") yang tidak cocok dengan path aktual)
+    # Gunakan direktori NPY yang sudah dihasilkan oleh pipelines/preprocess.py.
+    # Fallback ke config.system.npy_train_dir jika ada, atau konstruksi otomatis
+    # dari data_dir + processed/fits/train.
+    #
+    # PENTING: Jalankan `python main.py --mode preprocess` terlebih dahulu
+    # sebelum mode ini agar file .npy tersedia.
     # ------------------------------------------------------------------
-    fits_dir = config.system.fits_train_dir  # → "./data/raw/fits/train/"
-    if not os.path.isdir(fits_dir):
+    npy_train_dir = getattr(
+        config.system,
+        "npy_train_dir",
+        os.path.join(config.system.data_dir, "processed", "fits", "train"),
+    )
+    if not os.path.isdir(npy_train_dir):
         raise FileNotFoundError(
-            f"[CRITICAL] Direktori FITS tidak ditemukan: '{fits_dir}'. "
-            f"Periksa nilai 'fits_train_dir' di config.yaml."
+            f"[CRITICAL] Direktori NPY tidak ditemukan: '{npy_train_dir}'. "
+            f"Jalankan terlebih dahulu: python main.py --mode preprocess"
         )
 
     # Non-rekursif — partisi train sudah terisolasi di satu direktori datar.
-    # Glob rekursif dilarang karena ../fits/test/ mengandung 180 file FITS
+    # Glob rekursif dilarang karena ../processed/fits/test/ mengandung 180 file NPY
     # yang tidak boleh tersedot ke pipeline SSL.
-    image_paths = glob.glob(os.path.join(fits_dir, "*.fits"))
+    image_paths = glob.glob(os.path.join(npy_train_dir, "*.npy"))
 
     # FIX: Raise error eksplisit — jangan silent dry run
     if not image_paths:
         raise FileNotFoundError(
-            f"[CRITICAL] Tidak ada file .fits ditemukan di '{fits_dir}'. "
-            f"Pastikan file FITS sudah ada dan 'fits_train_dir' sudah benar. "
+            f"[CRITICAL] Tidak ada file .npy ditemukan di '{npy_train_dir}'. "
+            f"Pastikan `python main.py --mode preprocess` sudah dijalankan. "
             f"Training DIHENTIKAN untuk mencegah dry run yang menyesatkan."
         )
 
@@ -92,12 +100,12 @@ def train_simclr_routine(config):
     leaking = [p for p in image_paths if "/test/" in p.replace("\\", "/")]
     if leaking:
         raise RuntimeError(
-            f"[CRITICAL] Ditemukan {len(leaking)} file FITS dari partisi 'test' "
-            f"dalam dataset SSL! Periksa kembali nilai 'fits_train_dir' di config.yaml."
+            f"[CRITICAL] Ditemukan {len(leaking)} file NPY dari partisi 'test' "
+            f"dalam dataset SSL! Periksa kembali 'npy_train_dir' di config.yaml."
         )
 
-    print(f"[INFO] Ditemukan {len(image_paths)} file FITS untuk SSL training.")
-    print("[INFO] Preparing Dataloader (FITS)...")
+    print(f"[INFO] Ditemukan {len(image_paths)} file NPY untuk SSL training.")
+    print("[INFO] Preparing Dataloader (NPY — fast I/O)...")
 
     ssl_transform = get_ssl_transform(config)
 

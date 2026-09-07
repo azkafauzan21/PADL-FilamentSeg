@@ -2,23 +2,33 @@ import warnings
 
 import numpy as np
 import torch
-from astropy.io import fits
 from torch.utils.data import Dataset
 
 
 class SolarSSLDataset(Dataset):
     def __init__(self, fits_paths, transform=None, config=None):
         """
-        Dataset khusus FITS untuk pra-pelatihan SSL SimCLR.
+        Dataset untuk pra-pelatihan SSL SimCLR menggunakan file .npy hasil
+        pra-pemrosesan FITS (lihat pipelines/preprocess.py).
+
+        Perubahan dari versi sebelumnya:
+            - Input yang diterima berubah dari *.fits menjadi *.npy.
+            - Pembacaan data menggunakan np.load() (instan, tanpa I/O disk berat)
+              menggantikan astropy.io.fits (lambat, overhead dekompresi fpack).
+            - Logika normalisasi persentil dan augmentasi dipertahankan sepenuhnya.
+            - Format output tensor [C, H, W] = [1, 512, 512] dipertahankan.
 
         Args:
-            fits_paths (list): List path file .fits dari partisi TRAIN.
+            fits_paths (list): List path file .npy dari partisi TRAIN.
+                               Nama parameter dipertahankan 'fits_paths' untuk
+                               kompatibilitas dengan kode pemanggil yang sudah ada
+                               di train_simclr.py (cukup ubah glob *.fits → *.npy).
                                JANGAN menyertakan file dari partisi test.
             transform (albumentations.Compose): Transformasi fisika
                                                 (wajib bebas dari Flip/Rotation).
             config (OmegaConf): Konfigurasi sistem.
         """
-        self.fits_paths = fits_paths
+        self.fits_paths = fits_paths   # Sebenarnya list path *.npy — nama dipertahankan
         self.transform = transform
         self.config = config
 
@@ -26,45 +36,50 @@ class SolarSSLDataset(Dataset):
         return len(self.fits_paths)
 
     # ------------------------------------------------------------------
-    # FIX BUG-02: Pembacaan HDU yang robust untuk format fpack terkompresi
+    # Pembacaan NPY: O(1) I/O — menggantikan _load_fits_image berbasis astropy
     # ------------------------------------------------------------------
-    def _load_fits_image(self, path: str) -> np.ndarray:
+    def _load_npy_image(self, path: str) -> np.ndarray:
         """
-        Membaca file FITS dengan dukungan penuh untuk format fpack terkompresi.
+        Membaca file .npy yang telah dihasilkan oleh pipelines/preprocess.py.
 
-        Untuk FITS fpack (GONG): data ada di HDU[1] (CompImageHDU).
-        Untuk FITS standar: data ada di HDU[0] (PrimaryHDU).
+        File .npy dijamin:
+            - dtype: float32
+            - shape: (512, 512)
+            - bebas NaN/Inf (sudah dibersihkan saat preprocessing)
+            - nilai mentah dalam skala intensitas H-alpha fisik (BZERO/BSCALE sudah diterapkan)
 
-        Strategi iterasi: cari HDU pertama yang memiliki data array 2D valid,
-        tanpa mengandalkan indeks hardcode yang bisa salah.
+        np.load() menggunakan memory-mapped I/O secara internal (mmap_mode='r')
+        sehingga akses pertama jauh lebih cepat dari astropy fits.open() yang
+        harus melakukan dekompresi fpack dan parsing header FITS secara penuh.
         """
-        with fits.open(path, memmap=False) as hdul:
-            data = None
-            for hdu in hdul:
-                # Cek eksplisit: data ada dan merupakan array 2D (bukan header/tabel)
-                if hdu.data is not None and np.ndim(hdu.data) == 2:
-                    data = hdu.data
-                    break
+        try:
+            data = np.load(path)
+        except Exception as exc:
+            raise IOError(
+                f"[SolarSSLDataset] Gagal membaca file NPY: '{path}'. "
+                f"Pastikan pipeline preprocess sudah dijalankan. Error: {exc}"
+            ) from exc
 
-            if data is None:
-                raise ValueError(
-                    f"[SolarSSLDataset] Tidak ada data gambar 2D yang valid "
-                    f"di file FITS: {path}"
-                )
+        if data.ndim != 2:
+            raise ValueError(
+                f"[SolarSSLDataset] File NPY '{path}' memiliki shape {data.shape}. "
+                f"Diharapkan array 2D (H, W)."
+            )
 
-        # Astropy otomatis menerapkan BZERO/BSCALE saat open, sehingga
-        # data sudah dalam skala fisik. Konversi ke float32 untuk kompatibilitas PyTorch.
         return data.astype(np.float32)
 
     # ------------------------------------------------------------------
-    # FIX BUG-03: Normalisasi persentil dengan validasi rentang
+    # Normalisasi persentil dengan validasi rentang (dipertahankan dari versi FITS)
     # ------------------------------------------------------------------
     def _percentile_normalize(self, image: np.ndarray) -> np.ndarray:
         """
         Normalisasi kliping persentil [P_lower, P_upper] → [0.0, 1.0].
 
-        Termasuk guard untuk gambar hampir-konstan (misal akibat sensor saturated
-        atau file corrupt) yang dapat menyebabkan silent near-zero division.
+        Termasuk guard untuk gambar hampir-konstan (misal akibat sensor saturated)
+        yang dapat menyebabkan silent near-zero division.
+
+        Catatan: NaN/Inf sudah dibersihkan di preprocessing, namun guard ini
+        tetap dipertahankan sebagai lapisan keamanan tambahan.
         """
         p_lower = (
             self.config.physics_parameters.percentile_clip_lower
@@ -78,7 +93,7 @@ class SolarSSLDataset(Dataset):
         lo = np.percentile(image, p_lower)
         hi = np.percentile(image, p_upper)
 
-        # Guard: Jika rentang terlalu kecil, gambar kemungkinan corrupt/saturated.
+        # Guard: Jika rentang terlalu kecil, gambar kemungkinan saturated.
         # Mengembalikan tensor nol lebih aman daripada membiarkan near-zero division
         # menghasilkan tensor bernilai ~1.0 yang tidak informatif.
         if (hi - lo) < 1e-3:
@@ -97,11 +112,11 @@ class SolarSSLDataset(Dataset):
     def __getitem__(self, idx):
         path = self.fits_paths[idx]
 
-        # 1. Baca FITS dengan loader yang robust (FIX BUG-02)
-        image = self._load_fits_image(path)
+        # 1. Baca NPY — O(1) I/O tanpa overhead dekompresi FITS
+        image = self._load_npy_image(path)
 
-        # 2. Normalisasi fisika dengan validasi rentang (FIX BUG-03)
-        #    Membuang cosmic rays & solar flares (noise tajam di FITS)
+        # 2. Normalisasi fisika dengan validasi rentang
+        #    Membuang cosmic rays & solar flares (noise tajam)
         image = self._percentile_normalize(image)
 
         # 3. Augmentasi dua sudut pandang (view) untuk SimCLR
@@ -122,7 +137,8 @@ class SolarSSLDataset(Dataset):
             view_1 = torch.from_numpy(view_1)
             view_2 = torch.from_numpy(view_2)
 
-        # 5. Pastikan dimensi [C, H, W] → [1, H, W] untuk grayscale FITS
+        # 5. Pastikan dimensi [C, H, W] → [1, H, W] untuk grayscale
+        #    Output: [1, 512, 512] (setelah downsampling preprocessing)
         if view_1.ndim == 2:
             view_1 = view_1.unsqueeze(0)
             view_2 = view_2.unsqueeze(0)

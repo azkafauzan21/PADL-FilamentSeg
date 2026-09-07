@@ -7,8 +7,9 @@ system:
   weights_dir: "./weights"
 
   # --- Sub-path eksplisit untuk setiap partisi data ---
-  # FITS hanya dari partisi TRAIN — /test/ dikecualikan secara ketat (180 file FITS di sana)
+  # FITS (mentah) — sumber untuk preprocess.py
   fits_train_dir: "./data/raw/fits/train"
+  fits_test_dir: "./data/raw/fits/test"
   # JPEG berlabel untuk supervised fine-tuning
   jpeg_train_dir: "./data/raw/MAGFiLO_1.0_Kaggle_2026/train/train_images"
   # JPEG unlabelled untuk inferensi/Test — SATU-SATUNYA sumber evaluasi legal
@@ -18,6 +19,9 @@ system:
   # Split JSON yang dihasilkan oleh extract_metadata
   train_split_json: "./data/train_split.json"
   val_split_json: "./data/val_split.json"
+  # NPY (dihasilkan oleh preprocess.py) — sumber untuk train_simclr
+  npy_train_dir: "./data/processed/fits/train"
+  npy_test_dir: "./data/processed/fits/test"
 
 physics_parameters:
   percentile_clip_lower: 1
