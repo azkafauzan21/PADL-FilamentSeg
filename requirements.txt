@@ -1,0 +1,13 @@
+torch>=2.0.0
+torchvision
+transformers
+numpy
+pandas
+scikit-learn
+pycocotools
+opencv-python
+astropy
+sunpy
+albumentations
+tqdm
+omegaconf

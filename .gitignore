@@ -1,0 +1,22 @@
+# Lingkungan & Dependensi
+sl_env/
+venv/
+env/
+
+# Data & Bobot Model (Sangat berat, jangan di-push)
+data/
+weights/
+
+# Metrik Eksperimen
+runs/
+
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Konfigurasi Editor/OS
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,57 @@
+system:
+  seed: 42
+  workers: 4
+  fp16_precision: true
+  # Root data directory (dipertahankan untuk kompatibilitas extract_metadata)
+  data_dir: "./data"
+  weights_dir: "./weights"
+
+  # --- Sub-path eksplisit untuk setiap partisi data ---
+  # FITS hanya dari partisi TRAIN — /test/ dikecualikan secara ketat (180 file FITS di sana)
+  fits_train_dir: "./data/raw/fits/train"
+  # JPEG berlabel untuk supervised fine-tuning
+  jpeg_train_dir: "./data/raw/MAGFiLO_1.0_Kaggle_2026/train/train_images"
+  # JPEG unlabelled untuk inferensi/Test — SATU-SATUNYA sumber evaluasi legal
+  jpeg_test_dir: "./data/raw/MAGFiLO_1.0_Kaggle_2026/test/test_images"
+  # Anotasi COCO lengkap (input untuk extract_metadata)
+  coco_annotation_path: "./data/raw/MAGFiLO_1.0_Kaggle_2026/train/MAGFiLO_1.0_Annotations_kaggle2026_train.json"
+  # Split JSON yang dihasilkan oleh extract_metadata
+  train_split_json: "./data/train_split.json"
+  val_split_json: "./data/val_split.json"
+
+physics_parameters:
+  percentile_clip_lower: 1
+  percentile_clip_upper: 99
+  test_size_split: 0.2
+
+data_augmentation:
+  ssl:
+    crop_size: 2048
+    crop_scale: [0.2, 1.0]
+    color_jitter_brightness: 0.4
+    color_jitter_contrast: 0.4
+    blur_limit_min: 3
+    blur_limit_max: 7
+    jitter_prob: 0.8
+    blur_prob: 0.5
+  supervised:
+    resize_dim: 1024
+
+ssl_training:
+  backbone: "resnet50"
+  latent_dim: 128
+  batch_size: 16
+  epochs: 100
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  temperature: 0.1
+  log_every_n_steps: 10
+
+supervised_training:
+  batch_size: 4
+  epochs: 50
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  log_every_n_steps: 10
+  # Epoch pembekuan backbone sebelum full fine-tuning (Fix BUG-05)
+  freeze_backbone_epochs: 5
