@@ -116,14 +116,18 @@ data_augmentation:
 
 
 ssl_training:
-  backbone: "resnet50"
+  backbone: "resnet34"
   latent_dim: 128
-  batch_size: 16
-  epochs: 100
+  batch_size: 64        # ← Dinaikkan dari 16. Jumlah negatif: 2×64-2 = 126 (vs 30 sebelumnya).
+                        #   NT-Xent loss sangat bergantung pada jumlah negatif (SimCLR paper).
+  epochs: 200           # ← Dinaikkan dari 100. SSL membutuhkan lebih banyak epoch untuk konvergen.
   learning_rate: 0.0003
   weight_decay: 0.0001
-  temperature: 0.1
+  temperature: 0.07     # ← Diturunkan dari 0.1. Nilai paper asli SimCLR (Chen et al., 2020).
+                        #   Temperature rendah → distribusi softmax lebih peaked → gradien lebih kuat.
+  warmup_epochs: 10     # ← Epoch warmup LR linear sebelum CosineAnnealingLR aktif (sesuai sthalles).
   log_every_n_steps: 10
+
 
 supervised_training:
   batch_size: 4

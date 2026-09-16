@@ -138,10 +138,40 @@ def train_simclr_routine(config):
 
     os.makedirs(config.system.weights_dir, exist_ok=True)
 
+    # ── LR Scheduler: CosineAnnealingLR ──────────────────────────────────────
+    # Identik dengan sthalles SimCLR_01/run.py:
+    #   T_max = len(dataloader) → satu siklus cosine selesai dalam T_max epoch
+    #   scheduler.step() dipanggil SEKALI PER EPOCH setelah warmup
+    # Warmup linear 10 epoch pertama: LR naik dari 0 → base_lr
+    WARMUP_EPOCHS = getattr(config.ssl_training, 'warmup_epochs', 10)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=len(dataloader),
+        eta_min=0,
+        last_epoch=-1,
+    )
+    print(
+        f"[INFO] LR Scheduler: CosineAnnealingLR "
+        f"(T_max={len(dataloader)} batch/epoch) "
+        f"+ Linear Warmup {WARMUP_EPOCHS} epoch"
+    )
+
     # Counter global untuk log TensorBoard per iterasi
     global_step = 0
 
     for epoch in range(1, config.ssl_training.epochs + 1):
+        # ── Warmup LR Linear ─────────────────────────────────────────────────
+        # Selama WARMUP_EPOCHS pertama, naikkan LR secara linear: 0 → base_lr.
+        # Setelah warmup, CosineAnnealingLR mengambil alih (di-step per epoch).
+        if epoch <= WARMUP_EPOCHS:
+            warmup_lr = config.ssl_training.learning_rate * (epoch / WARMUP_EPOCHS)
+            for pg in optimizer.param_groups:
+                pg['lr'] = warmup_lr
+
+        # Log LR aktif ke TensorBoard
+        current_lr = optimizer.param_groups[0]['lr']
+        writer.add_scalar("SimCLR/LearningRate_epoch", current_lr, epoch)
+
         model.train()
         epoch_loss = 0.0
 
@@ -180,12 +210,20 @@ def train_simclr_routine(config):
 
         if len(dataloader) > 0:
             avg_loss = epoch_loss / len(dataloader)
+            current_lr = optimizer.param_groups[0]['lr']
             # Log NT-Xent loss rata-rata per epoch ke TensorBoard
             writer.add_scalar("SimCLR/NTXentLoss_epoch", avg_loss, epoch)
             print(
                 f"Epoch [{epoch}/{config.ssl_training.epochs}] "
-                f"- Average NT-Xent Loss: {avg_loss:.4f}"
+                f"- Loss: {avg_loss:.4f}"
+                f" | LR: {current_lr:.6f}"
+                f" {'[WARMUP]' if epoch <= WARMUP_EPOCHS else '[COSINE]'}"
             )
+
+        # ── Step Scheduler (setelah warmup selesai) ───────────────────────────
+        # Identik dengan sthalles: scheduler.step() per epoch, mulai epoch ke-11.
+        if epoch > WARMUP_EPOCHS:
+            scheduler.step()
 
         checkpoint_path = os.path.join(
             config.system.weights_dir, f"simclr_epoch_{epoch}.pth"
