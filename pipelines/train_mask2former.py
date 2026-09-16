@@ -195,10 +195,16 @@ def run_validation(
                 pq_val = compute_panoptic_quality(active_preds, active_gts, iou_threshold)
                 pq_scores.append(pq_val)
 
-    # dice_metric dengan average='none' menghasilkan tensor [num_classes].
-    # Ambil index [0] → skor Filament Body; Kelas 1 (Spine) tidak dievaluasi Kaggle.
-    dice_per_class = dice_metric.compute()   # shape: [num_classes]
-    avg_dice = float(dice_per_class[0].item())
+    # dice_metric dengan average='none' seharusnya menghasilkan tensor [num_classes].
+    # Guard diperlukan: jika epoch berjalan tanpa sampel valid (edge case),
+    # torchmetrics bisa mengembalikan tensor 0-dim (scalar) alih-alih [num_classes].
+    # Indexing [0] pada 0-dim tensor → IndexError. Tangani keduanya dengan aman.
+    dice_per_class = dice_metric.compute()
+    if dice_per_class.ndim == 0:
+        # Scalar fallback — tidak ada sampel valid yang diproses
+        avg_dice = 0.0
+    else:
+        avg_dice = float(dice_per_class[0].item())  # Kelas 0 = Filament Body
     avg_pq = float(sum(pq_scores) / len(pq_scores)) if pq_scores else 0.0
     return avg_dice, avg_pq
 
@@ -311,7 +317,7 @@ def train_mask2former_routine(config):
     set_backbone_grad(requires_grad=False)
     optimizer = make_optimizer(phase="frozen")
 
-    scaler = torch.cuda.amp.GradScaler() if config.system.fp16_precision else None
+    scaler = torch.amp.GradScaler('cuda') if config.system.fp16_precision else None
     if scaler:
         print("[INFO] Automatic Mixed Precision (AMP - fp16) ENABLED.")
 
@@ -454,7 +460,7 @@ def train_mask2former_routine(config):
             optimizer.zero_grad()
 
             if config.system.fp16_precision:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):   # API baru (PyTorch ≥ 2.0)
                     outputs = model(pixel_values=images, labels=targets)
                     loss = outputs.loss
                 scaler.scale(loss).backward()

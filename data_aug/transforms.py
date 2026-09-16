@@ -46,10 +46,13 @@ def get_ssl_transform(config):
 
         # ── GaussNoise ────────────────────────────────────────────────────
         # Mensimulasikan read-noise dan dark current detektor CCD GONG.
-        # var_limit dalam skala gambar ternormalisasi [0, 1].
+        # Catatan: API GaussNoise berubah di albumentations ≥ 2.0.
+        # Gunakan 'std_range' (baru) sebagai parameter utama.
         A.GaussNoise(
-            var_limit=list(ssl.gauss_noise_var_limit),
-            mean=0.0,
+            std_range=(
+                float(ssl.gauss_noise_var_limit[0]) ** 0.5,
+                float(ssl.gauss_noise_var_limit[1]) ** 0.5,
+            ),
             p=ssl.gauss_noise_prob,
         ),
     ])
@@ -98,14 +101,19 @@ def get_supervised_transform(config):
                 width=sup.resize_dim,
             ),
 
-            # ── ShiftScaleRotate ──────────────────────────────────────────
-            # Translasi dan skala saja. rotate_limit=0 menonaktifkan rotasi.
+            # ── Affine (ShiftScaleRotate) ─────────────────────────────────
+            # Translasi dan skala saja. rotate=0 menonaktifkan rotasi.
+            # Menggantikan ShiftScaleRotate yang deprecated di albumentations ≥ 2.0.
             # Mensimulasikan variasi posisi filamen dalam frame observasi GONG.
-            A.ShiftScaleRotate(
-                shift_limit=sup.shift_limit,
-                scale_limit=sup.scale_limit,
-                rotate_limit=rotate_limit,   # SELALU 0 — dijamin oleh guard di atas
-                border_mode=0,               # cv2.BORDER_CONSTANT: padding nol
+            A.Affine(
+                translate_percent={
+                    "x": (-sup.shift_limit, sup.shift_limit),
+                    "y": (-sup.shift_limit, sup.shift_limit),
+                },
+                scale=(1.0 - sup.scale_limit, 1.0 + sup.scale_limit),
+                rotate=0,              # SELALU 0 — dijamin oleh guard di atas
+                shear=0,
+                mode=0,               # cv2.BORDER_CONSTANT: padding nol
                 p=sup.shift_scale_prob,
             ),
 
@@ -122,8 +130,10 @@ def get_supervised_transform(config):
             # Noise pada gambar (tidak diterapkan ke mask).
             # Lebih konservatif dari SSL agar tidak merusak piksel mask.
             A.GaussNoise(
-                var_limit=list(sup.gauss_noise_var_limit),
-                mean=0.0,
+                std_range=(
+                    float(sup.gauss_noise_var_limit[0]) ** 0.5,
+                    float(sup.gauss_noise_var_limit[1]) ** 0.5,
+                ),
                 p=sup.gauss_noise_prob,
             ),
 
