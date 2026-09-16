@@ -65,20 +65,22 @@ def compute_panoptic_quality(
         # Jika salah satu kosong, PQ = 0
         return 0.0
 
-    pred_masks = pred_masks.bool()
-    gt_masks = gt_masks.bool()
+    # Pindahkan ke CPU SEBELUM komputasi matriks — mencegah pembuatan tensor
+    # sementara berukuran [Q_pred, Q_gt, H, W] di VRAM GPU (bisa > 4 GB).
+    pred_masks = pred_masks.bool().cpu()
+    gt_masks = gt_masks.bool().cpu()
 
     Q_pred = pred_masks.shape[0]
     Q_gt = gt_masks.shape[0]
 
-    # Hitung IoU semua pasangan (Q_pred × Q_gt) secara vektorisasi
+    # Hitung IoU semua pasangan (Q_pred × Q_gt) secara vektorisasi di CPU
     # Reshape: [Q_pred, 1, H, W] & [1, Q_gt, H, W]
     p = pred_masks.unsqueeze(1).float()  # [Q_pred, 1, H, W]
-    g = gt_masks.unsqueeze(0).float()   # [1, Q_gt, H, W]
+    g = gt_masks.unsqueeze(0).float()    # [1, Q_gt, H, W]
 
-    intersection = (p * g).sum(dim=(-2, -1))           # [Q_pred, Q_gt]
-    union = ((p + g) > 0).float().sum(dim=(-2, -1))    # [Q_pred, Q_gt]
-    iou_matrix = intersection / (union + 1e-6)          # [Q_pred, Q_gt]
+    intersection = (p * g).sum(dim=(-2, -1))            # [Q_pred, Q_gt]
+    union = ((p + g) > 0).float().sum(dim=(-2, -1))     # [Q_pred, Q_gt]
+    iou_matrix = intersection / (union + 1e-6)           # [Q_pred, Q_gt]
 
     # Greedy matching: pasangkan prediksi dengan GT terbaik (IoU tertinggi)
     matched_gt = set()
@@ -193,7 +195,10 @@ def run_validation(
                 pq_val = compute_panoptic_quality(active_preds, active_gts, iou_threshold)
                 pq_scores.append(pq_val)
 
-    avg_dice = float(dice_metric.compute().item())
+    # dice_metric dengan average='none' menghasilkan tensor [num_classes].
+    # Ambil index [0] → skor Filament Body; Kelas 1 (Spine) tidak dievaluasi Kaggle.
+    dice_per_class = dice_metric.compute()   # shape: [num_classes]
+    avg_dice = float(dice_per_class[0].item())
     avg_pq = float(sum(pq_scores) / len(pq_scores)) if pq_scores else 0.0
     return avg_dice, avg_pq
 
@@ -219,7 +224,13 @@ def train_mask2former_routine(config):
     # Inisialisasi Model
     # ------------------------------------------------------------------
     print(f"[INFO] Initializing FilamentMask2Former model (Backbone: {config.ssl_training.backbone})...")
-    model = FilamentMask2Former(num_classes=4, base_model=config.ssl_training.backbone)
+    model = FilamentMask2Former(
+        num_classes=2,
+        base_model=config.ssl_training.backbone,
+        # Teruskan latent_dim agar Stage 2 sinkron dengan Stage 1 SSL (FIX ERR-10)
+        # FilamentMask2Former meneruskan ini ke SolarSimCLR.__init__
+    )
+    # num_classes=2: Kelas 0 = Filament Body, Kelas 1 = Filament Spine
 
     # ------------------------------------------------------------------
     # Muat bobot backbone SimCLR dari Tahap 1
@@ -308,13 +319,26 @@ def train_mask2former_routine(config):
     # Torchmetrics: DiceScore
     # ------------------------------------------------------------------
     try:
-        from torchmetrics.segmentation import DiceScore
-        dice_metric = DiceScore(num_classes=4, average="macro").to(device)
-        use_metrics = True
-        print("[INFO] torchmetrics DiceScore: AKTIF")
+        import torchmetrics
+        tm_version = tuple(int(x) for x in torchmetrics.__version__.split(".")[:2])
+        if tm_version < (1, 0):
+            print(
+                f"[WARN] torchmetrics versi {torchmetrics.__version__} terdeteksi. "
+                f"DiceScore dari 'torchmetrics.segmentation' membutuhkan >= 1.0.0. "
+                f"Upgrade: pip install 'torchmetrics>=1.0.0'"
+            )
+            use_metrics = False
+            dice_metric = None
+        else:
+            from torchmetrics.segmentation import DiceScore
+            # average='none' → kembalikan skor per-kelas; kita ambil hanya kelas 0 (Filament Body)
+            # Kelas 1 (Spine) diabaikan karena Kaggle hanya menilai luasan tubuh filamen.
+            dice_metric = DiceScore(num_classes=2, average="none").to(device)
+            use_metrics = True
+            print("[INFO] torchmetrics DiceScore: AKTIF (num_classes=2, eval: Kelas 0 = Body only)")
     except ImportError:
         print("[WARN] torchmetrics tidak terinstal. Dice/PQ tidak akan dihitung. "
-              "Install dengan: pip install torchmetrics")
+              "Install dengan: pip install 'torchmetrics>=1.0.0'")
         use_metrics = False
         dice_metric = None
 
@@ -421,7 +445,11 @@ def train_mask2former_routine(config):
 
         for batch_idx, (images, targets) in enumerate(pbar):
             images = images.to(device)
-            targets = [{k: v.to(device) for k, v in target.items()} for target in targets]
+            # Pindahkan hanya nilai Tensor ke device; abaikan non-Tensor (FIX ERR-12)
+            targets = [
+                {k: v.to(device) for k, v in target.items() if isinstance(v, torch.Tensor)}
+                for target in targets
+            ]
 
             optimizer.zero_grad()
 

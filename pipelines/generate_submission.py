@@ -15,6 +15,8 @@ except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from models.segmenter_mask2former import FilamentMask2Former
 
+from data_aug.transforms import get_inference_transform
+
 
 # ---------------------------------------------------------------------------
 # RLE Encoding
@@ -88,7 +90,10 @@ def inference_routine(config):
     # ------------------------------------------------------------------
     # Muat model terlatih
     # ------------------------------------------------------------------
-    model = FilamentMask2Former(num_classes=1)
+    model = FilamentMask2Former(num_classes=2)
+    # num_classes=2: cocok dengan state_dict dari training (Body + Spine).
+    # Perubahan dari num_classes=1 menghilangkan RuntimeError size mismatch
+    # saat memuat checkpoint yang dilatih dengan skema 2-kelas.
 
     # Prioritaskan best checkpoint (smart checkpoint dari train_mask2former.py)
     best_weights_path = os.path.join(config.system.weights_dir, "best_mask2former.pth")
@@ -156,13 +161,16 @@ def inference_routine(config):
 
             image = image.astype(np.float32)
 
-            # Normalisasi persentil (simetris dengan SolarSSLDataset)
+            # Normalisasi persentil — parameter dari config (konsisten dengan training)
             p_lo = config.physics_parameters.percentile_clip_lower
             p_hi = config.physics_parameters.percentile_clip_upper
+            sat_threshold = float(
+                config.data_augmentation.inference.saturation_threshold
+            )
             lo = np.percentile(image, p_lo)
             hi = np.percentile(image, p_hi)
 
-            if (hi - lo) < 1e-3:
+            if (hi - lo) < sat_threshold:
                 # Gambar hampir konstan — set ke nol
                 image = np.zeros_like(image, dtype=np.float32)
             else:
@@ -172,20 +180,42 @@ def inference_routine(config):
             tensor_img = torch.from_numpy(image).unsqueeze(0).unsqueeze(0).to(device)
             # tensor_img shape: [1, 1, H, W]
 
-            mask_logits, _class_logits = model(pixel_values=tensor_img)
+            mask_logits, class_logits = model(pixel_values=tensor_img)
 
-            # mask_logits shape: [1, num_queries, H', W']
-            mask_logits = mask_logits.squeeze(0)  # → [num_queries, H', W']
+            # mask_logits  shape: [1, num_queries, H', W']
+            # class_logits shape: [1, num_queries, num_classes+1] (termasuk kelas 'no-object')
+            mask_logits  = mask_logits.squeeze(0)   # → [num_queries, H', W']
+            class_logits = class_logits.squeeze(0)  # → [num_queries, num_classes+1]
+
+            # Prediksi kelas per query: argmax di kelas valid (abaikan indeks 'no-object' terakhir)
+            pred_labels = class_logits[:, :-1].argmax(dim=-1)  # [num_queries], nilai: {0, 1}
 
             # Pisahkan instance: satu baris CSV per filamen yang terdeteksi
-            instances = separate_instances(mask_logits, threshold=0.5)
+            # mask_threshold dibaca dari config — turunkan untuk recall lebih tinggi
+            mask_threshold = float(config.data_augmentation.inference.mask_threshold)
+            instances = separate_instances(mask_logits, threshold=mask_threshold)
 
             if instances:
-                for inst_idx, inst_mask in enumerate(instances, start=1):
+                inst_csv_idx = 0
+                for q_idx, inst_mask in enumerate(instances):
+                    # STEALTH FILTER: hanya simpan mask Kelas 0 (Filament Body)
+                    # Kelas 1 (Spine) tidak dinilai oleh Kaggle → dibuang secara diam-diam.
+                    q_label = int(pred_labels[q_idx].item()) if q_idx < len(pred_labels) else 0
+                    if q_label != 0:
+                        continue
+
+                    inst_csv_idx += 1
                     rle_str = encode_binary_mask_to_rle(inst_mask)
                     results.append({
-                        "filament_id": f"{image_stem}_{inst_idx}",
+                        "filament_id": f"{image_stem}_{inst_csv_idx}",
                         "segmentation_rle": rle_str,
+                    })
+
+                if inst_csv_idx == 0:
+                    # Semua query diprediksi sebagai Spine → tidak ada body
+                    results.append({
+                        "filament_id": f"{image_stem}_0",
+                        "segmentation_rle": "",
                     })
             else:
                 # Tidak ada prediksi aktif — baris kosong wajib tetap ada

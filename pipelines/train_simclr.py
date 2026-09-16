@@ -125,6 +125,17 @@ def train_simclr_routine(config):
 
     print(f"[INFO] Starting Epoch Loop ({config.ssl_training.epochs} Epochs)")
 
+    # Guard ERR-08: Jika drop_last=True dan dataset < batch_size, DataLoader memiliki
+    # 0 batch. Training akan 'berhasil' tanpa satu pun update gradien dan menyimpan
+    # bobot random — hasil yang menyesatkan.
+    if len(dataloader) == 0:
+        raise RuntimeError(
+            f"[CRITICAL] DataLoader SSL menghasilkan 0 batch! "
+            f"Jumlah file NPY ({len(image_paths)}) lebih kecil dari batch_size "
+            f"({config.ssl_training.batch_size}). "
+            f"Solusi: kurangi batch_size atau tambah data NPY."
+        )
+
     os.makedirs(config.system.weights_dir, exist_ok=True)
 
     # Counter global untuk log TensorBoard per iterasi
@@ -143,7 +154,7 @@ def train_simclr_routine(config):
             optimizer.zero_grad()
 
             if config.system.fp16_precision:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):   # API baru (PyTorch ≥ 2.0)
                     z_i, _ = model(view_1)
                     z_j, _ = model(view_2)
                     loss = criterion(z_i, z_j)

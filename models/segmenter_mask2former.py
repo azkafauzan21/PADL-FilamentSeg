@@ -101,29 +101,12 @@ class FilamentMask2Former(nn.Module):
         )
         self.mask2former = Mask2FormerForUniversalSegmentation(config)
 
-        # 3. Patch konvolusi (fungsi ini kini akan menggunakan BACKBONE_CHANNELS dinamis)
-        self._patch_pixel_decoder_projections()
-        
-        # 4. Pasang DummyEncoder
-        self.dummy_encoder = DummyEncoder()
-        self.mask2former.model.pixel_level_module.encoder = self.dummy_encoder
-
-        # 3. FIX BUG-04: Patch seluruh konvolusi proyeksi di PixelDecoder
-        #
-        #    PixelDecoder HuggingFace diinisialisasi dengan channel Swin-T default:
-        #      input_projections : [768, 384, 192] (3 level, Swin stage 4,3,2)
-        #      lateral_convolutions: [96]           (1 level, Swin stage 1)
-        #
-        #    Kita patch ke channel ResNet50 yang sesuai:
-        #      input_projections : [2048, 1024, 512] (c4, c3, c2)
-        #      lateral_convolutions: [256]             (c1)
-        #
-        #    Patch dilakukan post-init karena backbone_config.hidden_sizes pada
-        #    Swin adalah properti terderivasi (embed_dim*2^i) yang tidak bisa
-        #    di-override secara langsung melalui Mask2FormerConfig.
+        # 3. Patch konvolusi PixelDecoder agar menerima channel dari backbone kita.
+        #    Patch dilakukan post-init karena Mask2FormerConfig tidak meng-expose
+        #    hidden_sizes backbone secara langsung.
         self._patch_pixel_decoder_projections()
 
-        # 4. Pasang DummyEncoder — bypass encoder bawaan
+        # 4. Pasang DummyEncoder — bypass encoder bawaan HuggingFace
         self.dummy_encoder = DummyEncoder()
         self.mask2former.model.pixel_level_module.encoder = self.dummy_encoder
 

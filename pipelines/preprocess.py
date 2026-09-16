@@ -27,7 +27,7 @@ import os
 import sys
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Literal
+from typing import Literal, Optional, Tuple  # Tuple & Optional: kompatibel Python 3.8+
 
 import cv2
 import numpy as np
@@ -65,7 +65,7 @@ STATUS_CACHED       = "cached"
 # Worker Function (top-level — wajib picklable untuk ProcessPoolExecutor)
 # ---------------------------------------------------------------------------
 
-def _worker_process_file(fits_path: str, npy_path: str) -> tuple[str, str]:
+def _worker_process_file(fits_path: str, npy_path: str) -> Tuple[str, str]:
     """
     Worker function yang dijalankan di subprocess terpisah.
 
@@ -87,17 +87,56 @@ def _worker_process_file(fits_path: str, npy_path: str) -> tuple[str, str]:
     if os.path.exists(npy_path):
         return STATUS_CACHED, ""
 
-    # --- Baca FITS dengan penangkap AstropyWarning ---
+    # --- Baca FITS: Data di HDU[1], Header Disk di HDU[1] ---
+    # DIVERIFIKASI dari inspeksi header aktual (2026-09-15):
+    #   HDU[0] = Primary header (NAXIS=0, tidak ada data piksel)
+    #   HDU[1] = Image Extension (NAXIS1=2048, NAXIS2=2048, berisi data)
+    #
+    # Keyword disk yang digunakan (HDU[1]):
+    #   CRPIX1 / CRPIX2  → pusat disk dalam piksel (1-indexed, FITS convention)
+    #   RADIUS           → radius disk dalam piksel (post-LMBCOR, paling akurat)
+    #   Fallback: FNDLMBXC, FNDLMBYC, FNDLMBMI (jika CRPIX tidak tersedia)
     try:
         with warnings.catch_warnings(record=True) as caught_warnings:
             warnings.simplefilter("always", AstropyWarning)
 
             with fits.open(fits_path, memmap=False) as hdul:
                 data = None
-                for hdu in hdul:
+                disk_cx: Optional[float] = None
+                disk_cy: Optional[float] = None
+                disk_r:  Optional[float] = None
+
+                for i, hdu in enumerate(hdul):
                     if hdu.data is not None and np.ndim(hdu.data) == 2:
                         data = hdu.data
-                        break
+                        hdr  = hdu.header
+
+                        # ── Ekstraksi pusat disk (FITS 1-indexed → Python 0-indexed) ──
+                        crpix1 = hdr.get("CRPIX1", None)
+                        crpix2 = hdr.get("CRPIX2", None)
+                        if crpix1 is not None and crpix2 is not None:
+                            # FITS convention: CRPIX adalah 1-indexed
+                            disk_cx = float(crpix1) - 1.0
+                            disk_cy = float(crpix2) - 1.0
+                        else:
+                            # Fallback: FNDLMBXC/YC (geometric limb center, juga 1-indexed)
+                            fndx = hdr.get("FNDLMBXC", None)
+                            fndy = hdr.get("FNDLMBYC", None)
+                            if fndx is not None and fndy is not None:
+                                disk_cx = float(fndx) - 1.0
+                                disk_cy = float(fndy) - 1.0
+
+                        # ── Ekstraksi radius disk (dalam piksel) ──
+                        radius_kw = hdr.get("RADIUS", None)
+                        if radius_kw is not None and float(radius_kw) > 0:
+                            disk_r = float(radius_kw)
+                        else:
+                            # Fallback: FNDLMBMI (semi-minor axis, lebih konservatif)
+                            fndmi = hdr.get("FNDLMBMI", None)
+                            if fndmi is not None and float(fndmi) > 0:
+                                disk_r = float(fndmi)
+
+                        break  # Ambil HDU pertama yang memiliki data 2D
 
         if caught_warnings:
             msg = str(caught_warnings[0].message)[:100]
@@ -109,16 +148,70 @@ def _worker_process_file(fits_path: str, npy_path: str) -> tuple[str, str]:
     except Exception as exc:
         return STATUS_SKIP_ERROR, str(exc)[:100]
 
-    # --- Konversi, bersihkan, downsample ---
+    # --- Konversi dtype, bersihkan NaN/Inf ---
     data = data.astype(np.float32)
-
     if not np.all(np.isfinite(data)):
         data = np.where(np.isfinite(data), data, 0.0)
 
-    data_downsampled = cv2.resize(data, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+    h_orig, w_orig = data.shape
+
+    # --- Solar Disk Crop (Fisika: buang ruang angkasa kosong) ---
+    # Jika header disk berhasil diekstrak, lakukan crop bounding square.
+    # Jika tidak (header korup/hilang), fallback ke pipeline lama (resize langsung).
+    if disk_cx is not None and disk_cy is not None and disk_r is not None and disk_r > 0:
+        # Bounding box bujur sangkar di sekitar disk matahari
+        # Margin kecil (+0.05 * r) untuk memastikan seluruh limb tertangkap
+        margin = disk_r * 0.05
+        r_padded = disk_r + margin
+
+        x0 = disk_cx - r_padded
+        y0 = disk_cy - r_padded
+        x1 = disk_cx + r_padded
+        y1 = disk_cy + r_padded
+
+        # ── Edge-case guard: clipping + zero-padding ──
+        # Jika bounding box melewati tepi gambar (matahari tidak di tengah),
+        # kita clip ke batas gambar dan pad sisi yang terpotong dengan nol.
+        #
+        # Contoh: GTCLMBXC=1026.92 → matahari sedikit bergeser ke kanan.
+        # Tanpa guard ini, slice negatif atau > dimensi akan melempar IndexError.
+        clip_x0 = max(0, int(round(x0)))
+        clip_y0 = max(0, int(round(y0)))
+        clip_x1 = min(w_orig, int(round(x1)))
+        clip_y1 = min(h_orig, int(round(y1)))
+
+        # Lebar/tinggi target (selalu simetris berdasarkan r_padded)
+        target_side = int(round(2 * r_padded))
+        if target_side < 1:
+            target_side = 1
+
+        # Potong area valid
+        crop = data[clip_y0:clip_y1, clip_x0:clip_x1]
+
+        # Hitung offset padding jika bounding box terpotong di salah satu sisi
+        pad_left = max(0, clip_x0 - int(round(x0)))
+        pad_top  = max(0, clip_y0 - int(round(y0)))
+
+        # Alokasikan canvas bujur sangkar dan salin crop ke dalamnya
+        canvas = np.zeros((target_side, target_side), dtype=np.float32)
+        crop_h, crop_w = crop.shape
+        # Guard tambahan: pastikan crop tidak melebihi canvas
+        end_row = min(pad_top  + crop_h, target_side)
+        end_col = min(pad_left + crop_w, target_side)
+        src_h   = end_row - pad_top
+        src_w   = end_col - pad_left
+        canvas[pad_top:end_row, pad_left:end_col] = crop[:src_h, :src_w]
+
+        data_to_resize = canvas
+    else:
+        # Fallback: tidak ada informasi disk → resize seluruh gambar
+        data_to_resize = data
+
+    # --- Resize ke TARGET_SIZE (flux-conserving: INTER_AREA) ---
+    data_final = cv2.resize(data_to_resize, TARGET_SIZE, interpolation=cv2.INTER_AREA)
 
     # --- Simpan ---
-    np.save(npy_path, data_downsampled.astype(np.float32))
+    np.save(npy_path, data_final.astype(np.float32))
 
     return STATUS_OK, ""
 

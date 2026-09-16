@@ -29,7 +29,9 @@ PADL-FilamentSeg implements a **sequential three-stage pipeline** that bridges u
 │                                                                         │
 │  Input : *.fits (16/32-bit, 2048×2048, from GONG network)              │
 │  Ops   : AstropyWarning catch (corrupt skip) → NaN/Inf → 0.0 →         │
-│          cv2.INTER_AREA downsample → float32 .npy                       │
+│          [BARU] Solar Disk Crop (CRPIX1/2 + RADIUS dari HDU[1]) →       │
+│          Zero-padding edge-case guard → cv2.INTER_AREA resize →         │
+│          float32 .npy                                                   │
 │  Output: data/processed/fits/{train,test}/*.npy  (512×512, ~1 MB/file) │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                 │
@@ -37,20 +39,30 @@ PADL-FilamentSeg implements a **sequential three-stage pipeline** that bridges u
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  STAGE 1 — Self-Supervised Pre-training (SimCLR)                        │
 │                                                                         │
-│  Input : NPY files (float32, 512×512, 1-channel)                        │
-│  Model : SolarSimCLR  (ResNet50 with 1-channel conv1 override)          │
+│  Input : NPY files (float32, 512×512, 1-channel, disk-cropped)         │
+│  Model : SolarSimCLR  (ResNet34 with 1-channel conv1 override)         │
 │  Loss  : NT-Xent Contrastive Loss                                       │
 │  Output: simclr_final.pth  (backbone weights encoding plasma physics)   │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                 │  Weight Handoff
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  STAGE 2 — Supervised Fine-Tuning (Mask2Former)                         │
+│  STAGE 2 — Supervised Fine-Tuning (Mask2Former, Multi-Task)             │
 │                                                                         │
 │  Input : JPEG images + COCO JSON annotations (Kaggle labeled set)       │
-│  Model : FilamentMask2Former  (HF Mask2Former + injected SimCLR backbone)│
+│  Classes: 2 — Kelas 0: Filament Body (category 1-4 dilebur)            │
+│                Kelas 1: Filament Spine (dari key 'spine' di JSON)       │
+│  Model : FilamentMask2Former (HF Mask2Former + injected SimCLR backbone)│
 │  Loss  : Bipartite Matching Loss (Hungarian + Dice/Focal)               │
-│  Output: best_mask2former.pth  (smart-checkpointed by Panoptic Quality) │
+│  Output: best_mask2former.pth  (smart-checkpointed by Body Dice + PQ)  │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STAGE 3 — Inference (Stealth Filter Mode)                              │
+│                                                                         │
+│  Filter: Hanya mask Kelas 0 (Body) yang ditulis ke submission.csv       │
+│  Kelas 1 (Spine) dibuang — Kaggle hanya menilai luasan tubuh filamen.  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,7 +80,11 @@ By pre-training SimCLR on FITS-derived NPY matrices, the backbone learns to dete
 - **Thermal topology** of quiescent filament channels vs. surrounding chromospheric network
 - **Limb darkening** as an atmospheric effect to discount — not a signal to segment
 
-The FITS files are pre-processed offline to NPY format (512×512) using `cv2.INTER_AREA` downsampling, which preserves the **spatial flux ratio** between pixels by computing the true average over each 4×4 source region. This is physically correct: it is equivalent to integrating the H-alpha emission over a coarser spatial resolution, not interpolating pixel values.
+The FITS files are pre-processed offline to NPY format (512×512) using a **two-step spatial pipeline**:
+
+1. **Solar Disk Isolation (BARU):** The FITS header in `HDU[1]` contains `CRPIX1`/`CRPIX2` (disk center in pixel coordinates) and `RADIUS` (disk radius in pixels, post-LMBCOR geometric correction). The pre-processor crops a bounding square around the solar disk, eliminating ~40% dark-sky pixels at the image corners. An edge-case padding guard handles the rare case where the disk is not perfectly centered (e.g., `GTCLMBXC=1026.92` vs. `CRPIX1=1024.0`), using zero-padding to fill clipped edges.
+
+2. **Flux-Conserving Resize:** After cropping, the result is resized to `512×512` using `cv2.INTER_AREA`, which computes the true area-weighted average over each source region. This is physically correct: equivalent to integrating H-alpha emission over a coarser spatial resolution.
 
 The NT-Xent loss then acts as a **plasma distribution capture mechanism**: it forces the latent space to cluster representations of filament structures with identical thermodynamic topology even under extreme observational flux variation (e.g., equatorial vs. limb-darkened filaments), reducing sensitivity to instrument flux artifacts while preserving morphological invariants.
 
@@ -302,13 +318,17 @@ This step is intentionally decoupled from training to eliminate I/O bottlenecks.
 
 **What happens internally:**
 1. Scans all `*.fits` files in `fits_train_dir` and `fits_test_dir`.
-2. Opens each file with `astropy.io.fits`. If `AstropyWarning` is raised (truncated / corrupt file), the file is **silently skipped** and logged.
+2. Opens each file. Data berada di `HDU[1]` (terverifikasi dari inspeksi aktual). If `AstropyWarning` is raised, the file is silently skipped.
 3. Replaces all `NaN` and `Inf` values with `0.0`.
-4. Downsamples `2048×2048 → 512×512` using **`cv2.INTER_AREA`** (area-weighted average — spatially conservative for H-alpha flux data).
-5. Saves as `float32` `.npy` to the mirrored directory structure under `data/processed/fits/`.
-6. **Idempotent**: already-converted files are skipped on re-runs.
+4. **[BARU] Solar Disk Crop:** Reads `CRPIX1`, `CRPIX2` (disk center, 1-indexed) and `RADIUS` (disk radius in pixels) from `HDU[1]` header. Falls back to `FNDLMBXC/YC/FNDLMBMI` if primary keywords are absent.
+   - Computes a bounding square: center ± (radius × 1.05 margin).
+   - Clips bounding box to image dimensions and zero-pads clipped edges (edge-case guard).
+5. Resizes cropped disk region to `512×512` using **`cv2.INTER_AREA`**.
+6. Saves as `float32` `.npy`. **Idempotent**: existing files are skipped on re-runs.
 
-> **Known anomaly handled:** The file `data/raw/fits/train/20110126130634Ch.fits` (~712 KB vs. ~2.6 MB typical) was identified during the 2026-09-07 audit as a likely corrupt or truncated file. This file will trigger an `AstropyWarning` and be automatically skipped by the pre-processor.
+> **Note:** Pre-processed NPY files from before this update encode the full 2048×2048 frame (downsampled). **Re-run `python main.py --mode preprocess` after deleting the existing NPY cache** to apply the new solar disk crop. The crop improves signal-to-noise by eliminating dark-sky corner pixels.
+
+> **Known anomaly handled:** The file `data/raw/fits/train/20110126130634Ch.fits` (~712 KB vs. ~2.6 MB typical) will trigger `AstropyWarning` and be automatically skipped.
 
 **Outputs generated:**
 ```
@@ -375,13 +395,23 @@ python main.py --mode train_mask2former --lr=0.00005 --workers=2
 ```
 
 **What happens internally:**
-1. Loads `FilamentMask2Former` and injects `simclr_final.pth` backbone weights (`strict=False`).
+1. Loads `FilamentMask2Former(num_classes=2)` and injects `simclr_final.pth` backbone weights (`strict=False`).
+   - `num_classes=2`: **Kelas 0 = Filament Body**, **Kelas 1 = Filament Spine**
 2. **Phase 1** (epochs 1–`freeze_backbone_epochs`): backbone frozen, only decoder parameters trained.
 3. **Phase 2** (subsequent epochs): backbone unfrozen with 10× differential learning rate.
 4. After each training epoch, runs a **validation loop** on `val_split.json` to compute:
-   - `DiceScore` (via `torchmetrics`) — pixel-level overlap quality
+   - `DiceScore` (Body only, Kelas 0) — `average='none'` mengembalikan skor per-kelas; hanya indeks 0 dilaporkan.
    - `Panoptic Quality (PQ)` — instance-level matching quality (IoU-based greedy matching)
 5. **Smart checkpointing**: saves `best_mask2former.pth` **only** when validation PQ exceeds the current best.
+
+**Multi-Task Class Schema:**
+
+| Class ID | Name | Source di JSON |
+|---|---|---|
+| 0 | Filament Body | Semua `category_id` (1,2,3,4) dilebur menjadi satu kelas |
+| 1 | Filament Spine | Key `"spine"` (list of `[x,y]`) di setiap anotasi, di-render via `cv2.polylines(thickness=2)` |
+
+Spine mask tidak dimasukkan ke submission (Stealth Filter di Stage 3), namun melatih model untuk mengenali struktur magnetik sumbu filamen, meningkatkan internal representation.
 
 **Outputs:**
 ```
@@ -402,11 +432,12 @@ python main.py --mode generate_submission
 ```
 
 **What happens internally:**
-1. Loads `best_mask2former.pth` (falls back to `mask2former_final.pth` if best not found).
+1. Loads `FilamentMask2Former(num_classes=2)` — konsisten dengan checkpoint training, menghilangkan `RuntimeError` size mismatch.
 2. Reads all JPEG images from `jpeg_test_dir`.
-3. For each image: applies percentile normalization → runs model → separates per-query instance masks.
-4. Encodes each instance mask to RLE using `pycocotools`.
-5. Writes `data/submission.csv` with header `filament_id,segmentation_rle`.
+3. For each image: applies percentile normalization → runs model → extracts `mask_logits` and `class_logits`.
+4. **Stealth Filter:** Prediksi kelas diekstrak dari `class_logits`. Hanya mask dengan `pred_label == 0` (Kelas 0: Body) yang diproses dan disimpan ke CSV. Mask Kelas 1 (Spine) dibuang secara diam-diam karena Kaggle evaluator tidak menilainya.
+5. Encodes each Body instance mask to RLE using `pycocotools` (Fortran-order).
+6. Writes `data/submission.csv`.
 
 **Output:**
 ```
@@ -513,7 +544,7 @@ Navigate to `http://localhost:6006` to view real-time curves.
 | `SimCLR/NTXentLoss_epoch` | `train_simclr` | NT-Xent loss averaged per epoch |
 | `Train/BipartiteLoss_iter` | `train_mask2former` | Bipartite matching loss per batch iteration |
 | `Train/BipartiteLoss_epoch` | `train_mask2former` | Bipartite matching loss averaged per epoch |
-| `Val/DiceScore` | `train_mask2former` | Validation Dice score per epoch |
+| `Val/DiceScore` | `train_mask2former` | Dice score Kelas 0 (Body only) per epoch |
 | `Val/PanopticQuality` | `train_mask2former` | Validation PQ per epoch (drives smart checkpointing) |
 
 ---

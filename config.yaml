@@ -29,17 +29,91 @@ physics_parameters:
   test_size_split: 0.2
 
 data_augmentation:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # SSL (SimCLR) — Augmentasi untuk Stage 1 (train_simclr)
+  # LARANGAN FISIKA: DILARANG tambahkan HorizontalFlip, VerticalFlip,
+  #                  atau Rotate — melanggar kiralitas magnetik filamen.
+  # ─────────────────────────────────────────────────────────────────────────
   ssl:
-    crop_size: 2048
-    crop_scale: [0.2, 1.0]
-    color_jitter_brightness: 0.4
-    color_jitter_contrast: 0.4
-    blur_limit_min: 3
-    blur_limit_max: 7
-    jitter_prob: 0.8
-    blur_prob: 0.5
+    # RandomResizedCrop — simulasi observasi dari jarak/sudut pandang berbeda
+    crop_size: 224          # Ukuran output crop (px). Harus ≤ ukuran NPY (512px).
+                            # Standar SimCLR: 224. Nilai aman: 224–448.
+    crop_scale: [0.2, 1.0] # Rentang area relatif crop terhadap gambar asli.
+                            # [0.2, 1.0] = 20%–100% area sumber.
+
+    # ColorJitter — simulasi variasi kecerahan instrumen GONG antar stasiun
+    color_jitter_brightness: 0.4   # Faktor perubahan kecerahan acak. Rentang: [0, 1].
+    color_jitter_contrast: 0.4     # Faktor perubahan kontras acak. Rentang: [0, 1].
+    jitter_prob: 0.8               # Probabilitas menerapkan ColorJitter per sampel.
+
+    # GaussianBlur — simulasi smearing atmosfer (seeing)
+    blur_limit_min: 3    # Ukuran kernel Gaussian minimum (harus bilangan ganjil).
+    blur_limit_max: 7    # Ukuran kernel Gaussian maksimum (harus bilangan ganjil).
+    blur_prob: 0.5       # Probabilitas menerapkan blur per sampel.
+
+    # GaussNoise — simulasi read-noise dan dark current sensor GONG
+    gauss_noise_var_limit: [0.001, 0.01]  # Rentang varians noise. [min, max].
+                                           # Nilai relatif terhadap gambar ternormalisasi [0,1].
+    gauss_noise_prob: 0.3                 # Probabilitas menerapkan noise per sampel.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Supervised — Augmentasi untuk Stage 2 (train_mask2former)
+  # LARANGAN FISIKA: SAMA — tidak ada Flip atau Rotate.
+  # Augmentasi supervised lebih konservatif dari SSL karena harus menjaga
+  # konsistensi mask-gambar secara piksel-sempurna.
+  # ─────────────────────────────────────────────────────────────────────────
   supervised:
-    resize_dim: 1024
+    # Resize — standarisasi ukuran input Mask2Former
+    resize_dim: 512         # Panjang sisi output (px). Input JPEG Kaggle: ~1024px.
+                            # Rekomendasi VRAM: 512 (aman), 768 (butuh ~12 GB), 1024 (butuh ~20 GB).
+
+    # ShiftScaleRotate — translasi & skala saja (rotate_limit=0 menonaktifkan rotasi)
+    # Digunakan untuk mensimulasikan variasi posisi filamen dalam frame observasi.
+    shift_limit: 0.05       # Translasi maksimum (fraction gambar). 0.05 = ±5% lebar/tinggi.
+    scale_limit: 0.1        # Skala acak. 0.1 = ±10% dari ukuran asli.
+    rotate_limit: 0         # DILARANG FISIKA: set 0 untuk menonaktifkan rotasi.
+    shift_scale_prob: 0.3   # Probabilitas menerapkan ShiftScaleRotate per sampel.
+
+    # ElasticTransform — deformasi elastis ringan, mensimulasikan distorsi atmosfer
+    elastic_alpha: 15.0     # Intensitas deformasi. Nilai besar = deformasi kuat.
+    elastic_sigma: 4.0      # Smoothness deformasi. Nilai kecil = deformasi kasar.
+    elastic_prob: 0.2       # Probabilitas per sampel. Set 0.0 untuk menonaktifkan.
+
+    # GaussNoise — konsisten dengan SSL, berlaku pada gambar+mask sekaligus
+    gauss_noise_var_limit: [0.001, 0.005]  # Lebih konservatif dari SSL.
+    gauss_noise_prob: 0.2
+
+    # GaussianBlur — simulasi smearing untuk supervised (lebih ringan dari SSL)
+    blur_limit_min: 3
+    blur_limit_max: 5
+    blur_prob: 0.2
+
+    # Sharpen — menonjolkan tepi filamen (berlawanan dengan blur)
+    # Digunakan bergantian dengan blur untuk melatih model pada gambar tajam dan blur.
+    sharpen_alpha: [0.1, 0.3]  # Kekuatan sharpening. [min, max].
+    sharpen_prob: 0.15
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Spine Rendering — parameter render mask sumbu filamen (Kelas 1)
+  # Digunakan di dataloaders/dataset_supervised.py
+  # ─────────────────────────────────────────────────────────────────────────
+  spine:
+    polyline_thickness: 2   # Ketebalan garis cv2.polylines() dalam piksel.
+                            # Nilai kecil (1–2): representasi PIL yang akurat.
+                            # Nilai besar (3–5): memberi model lebih banyak sinyal spine.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Inference — parameter normalisasi saat generate_submission
+  # ─────────────────────────────────────────────────────────────────────────
+  inference:
+    saturation_threshold: 1.0e-3   # Threshold |hi - lo| untuk mendeteksi gambar jenuh.
+                                    # Gambar dengan rentang persentil < nilai ini dianggap
+                                    # rusak dan diganti tensor nol.
+    mask_threshold: 0.5            # Threshold sigmoid untuk mengubah logit menjadi mask biner.
+                                    # 0.5 = titik tengah sigmoid. Turunkan untuk recall lebih tinggi.
+
+
 
 ssl_training:
   backbone: "resnet50"
