@@ -1,53 +1,118 @@
+"""
+transforms.py -- Pipeline Augmentasi PADL-FilamentSeg
+
+Perombakan (2026-09-16):
+  DIHAPUS:
+    - RandomResizedCrop : Crop acak membuang konten piringan matahari yang berguna.
+                          Model menerima piringan secara UTUH.
+    - ColorJitter       : Manipulasi fluks H-alpha secara artifisial melanggar fisika.
+                          Intensitas foton H-alpha adalah besaran fisis terukur.
+  DITAMBAHKAN:
+    - A.Resize(..., interpolation=cv2.INTER_CUBIC)
+      Bicubic mempertahankan kualitas tepi filamen lebih baik dari INTER_LINEAR.
+    - A.Affine(translate=0.1, scale=(0.7,1.3), rotate=[-5,5], shear=[-2,2], p=0.5)
+      Simulasi tracking error teleskop GONG:
+        * translate : drift posisi solar disk dalam frame FOV
+        * scale     : variasi magnifikasi akibat refraksi atmosfer elevasi rendah
+        * rotate    : rotasi instrumen +-5 deg (tidak merusak kiralitas global filamen)
+        * shear     : distorsi optis tangensial
+
+  DIPERTAHANKAN:
+    - GaussianBlur : Atmospheric seeing (turbulensi kolom atmosfer darat GONG).
+    - GaussNoise   : Read-noise dan dark current CCD sensor GONG.
+
+LARANGAN FISIKA (dikodekan keras):
+    x HorizontalFlip / VerticalFlip : Membalik kiralitas magnetik filamen.
+    x Rotate bebas (>5 deg)         : Rotasi besar memutar koordinat ekuatorial.
+
+Konsistensi SSL <-> Supervised:
+    - Resolusi identik: image_size x image_size (default 512x512)
+    - Affine identik: parameter sama di kedua pipeline
+    - Interpolasi identik: cv2.INTER_CUBIC
+    -> Mencegah "scale shock" antara Stage 1 dan Stage 2.
+"""
+
+import cv2
 import albumentations as A
 
 
+# ---------------------------------------------------------------------------
+# Helper: Affine presisi rendah (tracking error teleskop)
+# Dipanggil oleh SSL dan Supervised -- parameter identik untuk konsistensi.
+# ---------------------------------------------------------------------------
+
+def _tracking_error_affine(p: float = 0.5) -> A.Affine:
+    """
+    Affine transform yang mensimulasikan tracking error teleskop GONG.
+
+      translate_percent=0.1 : Drift +-10% FOV (pointing error GONG antar-exposure).
+      scale=(0.7, 1.3)      : Magnifikasi +-30% -- refraksi diferensial atmosfer.
+      rotate=[-5, 5]        : Drift rotasi +-5 deg instrumen -- tidak merusak kiralitas
+                              global filamen (filamen tidak terbalik, hanya dirotasi).
+      shear=[-2, 2]         : Distorsi tangensial optis +-2 deg.
+      interpolation=CUBIC   : Bicubic -- konsisten dengan Resize.
+      mode=0                : cv2.BORDER_CONSTANT -- padding nol untuk area di luar FOV.
+    """
+    return A.Affine(
+        translate_percent=0.1,
+        scale=(0.7, 1.3),
+        rotate=[-5, 5],
+        shear=[-2, 2],
+        interpolation=cv2.INTER_CUBIC,
+        mode=0,
+        p=p,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: SSL SimCLR Pre-training
+# ---------------------------------------------------------------------------
+
 def get_ssl_transform(config):
     """
-    Pipeline augmentasi untuk Stage 1 — SSL SimCLR pre-training.
+    Pipeline augmentasi untuk Stage 1 -- SSL SimCLR pre-training.
 
-    Semua parameter dibaca dari config.data_augmentation.ssl sehingga
-    dapat dikontrol sepenuhnya melalui config.yaml tanpa menyentuh kode.
+    Diterapkan DUA KALI secara independen pada gambar yang sama untuk menghasilkan
+    dua view kontrastif (view_1 dan view_2) di SolarSSLDataset.__getitem__().
 
-    LARANGAN FISIKA (tidak dapat dikonfigurasi):
-        - HorizontalFlip / VerticalFlip: melanggar kiralitas filamen
-        - Rotate: mengubah koordinat ekuatorial & heliolatitude
+    Input: NPY 512x512 float32, ternormalisasi [0, 1].
+
+    LARANGAN FISIKA (dikodekan keras):
+        x HorizontalFlip / VerticalFlip
+        x Rotate bebas (hanya +-5 deg diizinkan via Affine)
     """
     ssl = config.data_augmentation.ssl
 
+    # Prioritas: ssl_training.image_size > data_augmentation.ssl.image_size > 512
+    image_size = int(
+        getattr(config.ssl_training, "image_size", None)
+        or getattr(ssl, "image_size", 512)
+    )
+
     return A.Compose([
-        # ── RandomResizedCrop ─────────────────────────────────────────────
-        # Mensimulasikan observasi dari jarak & sudut pandang berbeda.
-        # crop_size harus ≤ ukuran NPY (512px, output preprocess.py).
-        A.RandomResizedCrop(
-            size=(ssl.crop_size, ssl.crop_size),
-            scale=list(ssl.crop_scale),
-            p=1.0,
+        # -- Resize Bicubic --------------------------------------------------
+        # Terima piringan matahari secara UTUH -- tidak ada cropping.
+        # INTER_CUBIC: presisi lebih tinggi untuk struktur filamen yang tipis.
+        A.Resize(
+            height=image_size,
+            width=image_size,
+            interpolation=cv2.INTER_CUBIC,
         ),
 
-        # ── ColorJitter ───────────────────────────────────────────────────
-        # Mensimulasikan variasi kecerahan instrumen GONG antar stasiun
-        # (Cerro Tololo, Learmonth, Maui, dll.) yang memiliki kalibrasi flux berbeda.
-        A.ColorJitter(
-            brightness=ssl.color_jitter_brightness,
-            contrast=ssl.color_jitter_contrast,
-            saturation=0,   # Gambar grayscale — saturation selalu 0
-            hue=0,          # Gambar grayscale — hue selalu 0
-            p=ssl.jitter_prob,
-        ),
+        # -- Affine (Tracking Error Teleskop) --------------------------------
+        # Parameter identik dengan supervised untuk konsistensi antar-fase.
+        _tracking_error_affine(p=0.5),
 
-        # ── GaussianBlur ──────────────────────────────────────────────────
-        # Mensimulasikan smearing atmosfer (atmospheric seeing) — GONG
-        # mengobservasi dari darat sehingga turbulensi atmosfer merupakan
-        # sumber degradasi yang nyata.
+        # -- GaussianBlur (Atmospheric Seeing) --------------------------------
+        # Turbulensi kolom atmosfer darat GONG (Cerro Tololo, Learmonth, Maui).
         A.GaussianBlur(
             blur_limit=(ssl.blur_limit_min, ssl.blur_limit_max),
             p=ssl.blur_prob,
         ),
 
-        # ── GaussNoise ────────────────────────────────────────────────────
-        # Mensimulasikan read-noise dan dark current detektor CCD GONG.
-        # Catatan: API GaussNoise berubah di albumentations ≥ 2.0.
-        # Gunakan 'std_range' (baru) sebagai parameter utama.
+        # -- GaussNoise (Read-Noise & Dark Current CCD) -----------------------
+        # API albumentations >= 2.0: std_range (bukan var_limit).
+        # Konversi: std = sqrt(var) agar secara fisika ekuivalen.
         A.GaussNoise(
             std_range=(
                 float(ssl.gauss_noise_var_limit[0]) ** 0.5,
@@ -58,77 +123,53 @@ def get_ssl_transform(config):
     ])
 
 
+# ---------------------------------------------------------------------------
+# Stage 2: Supervised Mask2Former Fine-Tuning
+# ---------------------------------------------------------------------------
+
 def get_supervised_transform(config):
     """
-    Pipeline augmentasi untuk Stage 2 — Supervised Fine-Tuning Mask2Former.
+    Pipeline augmentasi untuk Stage 2 -- Supervised Fine-Tuning Mask2Former.
 
-    Semua parameter dibaca dari config.data_augmentation.supervised.
-    Augmentasi ini diterapkan secara konsisten ke GAMBAR DAN MASK secara
-    bersamaan oleh albumentations (pixel-perfect mask alignment terjaga).
+    Diterapkan secara konsisten ke GAMBAR DAN SEMUA MASK secara bersamaan
+    oleh albumentations (pixel-perfect mask alignment terjaga).
 
-    Augmentasi lebih konservatif dari SSL karena mask instance harus
-    tetap valid setelah transformasi.
+    Input: JPEG Kaggle (resolusi bervariasi) float32, ternormalisasi [0, 1].
 
-    LARANGAN FISIKA (tidak dapat dikonfigurasi):
-        - HorizontalFlip / VerticalFlip
-        - Rotate (rotate_limit di config harus selalu 0)
+    Konsistensi dengan SSL:
+      - Resolusi: image_size x image_size (identik)
+      - Affine: parameter identik (mencegah scale shock Stage 1 -> Stage 2)
+      - Interpolasi: INTER_CUBIC (identik)
+
+    LARANGAN FISIKA (dikodekan keras):
+        x HorizontalFlip / VerticalFlip
+        x Rotate bebas (hanya +-5 deg diizinkan via Affine)
     """
     sup = config.data_augmentation.supervised
 
-    # Verifikasi larangan fisika: rotate_limit harus 0
-    # Jika seseorang secara tidak sengaja mengubahnya di config.yaml,
-    # ini akan memberikan peringatan eksplisit daripada diam-diam melatih
-    # model dengan data yang melanggar hukum fisika kiralitas.
-    if hasattr(sup, 'rotate_limit') and sup.rotate_limit != 0:
-        import warnings
-        warnings.warn(
-            f"[PHYSICS VIOLATION] supervised.rotate_limit = {sup.rotate_limit} "
-            f"terdeteksi di config.yaml! Rotasi melanggar kiralitas magnetik filamen. "
-            f"Nilai ini DIPAKSA ke 0. Set ke 0 di config.yaml untuk menghilangkan peringatan ini.",
-            stacklevel=2,
-        )
-        rotate_limit = 0
-    else:
-        rotate_limit = 0  # Selalu 0, diabaikan jika key tidak ada
+    # Prioritas: supervised_training.image_size > data_augmentation.supervised.image_size > 512
+    image_size = int(
+        getattr(config.supervised_training, "image_size", None)
+        or getattr(sup, "image_size", 512)
+    )
 
     return A.Compose(
         [
-            # ── Resize ────────────────────────────────────────────────────
-            # Standarisasi ukuran input untuk Mask2Former.
-            # resize_dim: 512 px direkomendasikan untuk VRAM < 16 GB.
+            # -- Resize Bicubic -----------------------------------------------
+            # Standarisasi JPEG Kaggle -> image_size x image_size.
+            # INTER_CUBIC identik dengan SSL.
             A.Resize(
-                height=sup.resize_dim,
-                width=sup.resize_dim,
+                height=image_size,
+                width=image_size,
+                interpolation=cv2.INTER_CUBIC,
             ),
 
-            # ── Affine (ShiftScaleRotate) ─────────────────────────────────
-            # Translasi dan skala saja. rotate=0 menonaktifkan rotasi.
-            # Menggantikan ShiftScaleRotate yang deprecated di albumentations ≥ 2.0.
-            # Mensimulasikan variasi posisi filamen dalam frame observasi GONG.
-            A.Affine(
-                translate_percent={
-                    "x": (-sup.shift_limit, sup.shift_limit),
-                    "y": (-sup.shift_limit, sup.shift_limit),
-                },
-                scale=(1.0 - sup.scale_limit, 1.0 + sup.scale_limit),
-                rotate=0,              # SELALU 0 — dijamin oleh guard di atas
-                shear=0,
-                mode=0,               # cv2.BORDER_CONSTANT: padding nol
-                p=sup.shift_scale_prob,
-            ),
+            # -- Affine (Tracking Error Teleskop) ----------------------------
+            # Diterapkan ke gambar DAN mask secara bersamaan -- alignment sempurna.
+            _tracking_error_affine(p=0.5),
 
-            # ── ElasticTransform ──────────────────────────────────────────
-            # Deformasi elastis ringan mensimulasikan distorsi atmosfer lokal.
-            # Diterapkan ke gambar DAN mask secara bersamaan.
-            A.ElasticTransform(
-                alpha=sup.elastic_alpha,
-                sigma=sup.elastic_sigma,
-                p=sup.elastic_prob,
-            ),
-
-            # ── GaussNoise ────────────────────────────────────────────────
-            # Noise pada gambar (tidak diterapkan ke mask).
-            # Lebih konservatif dari SSL agar tidak merusak piksel mask.
+            # -- GaussNoise (Read-Noise & Dark Current CCD) ------------------
+            # Hanya ke gambar (albumentations tidak menoise mask binary).
             A.GaussNoise(
                 std_range=(
                     float(sup.gauss_noise_var_limit[0]) ** 0.5,
@@ -137,37 +178,36 @@ def get_supervised_transform(config):
                 p=sup.gauss_noise_prob,
             ),
 
-            # ── GaussianBlur ──────────────────────────────────────────────
-            # Smearing ringan pada gambar untuk robustness terhadap seeing.
+            # -- GaussianBlur (Atmospheric Seeing) ---------------------------
+            # Lebih konservatif dari SSL (blur_limit_max lebih kecil).
             A.GaussianBlur(
                 blur_limit=(sup.blur_limit_min, sup.blur_limit_max),
                 p=sup.blur_prob,
             ),
-
-            # ── Sharpen ───────────────────────────────────────────────────
-            # Penonjolan tepi filamen. Diterapkan bergantian dengan blur
-            # sehingga model belajar pada gambar tajam maupun kabur.
-            A.Sharpen(
-                alpha=list(sup.sharpen_alpha),
-                lightness=(0.9, 1.1),  # Perubahan kecerahan minimal saat sharpening
-                p=sup.sharpen_prob,
-            ),
         ],
-        # Albumentations menjamin transformasi spasial (Resize, ShiftScaleRotate,
-        # ElasticTransform) diterapkan identik ke gambar dan semua mask.
-        # GaussNoise dan blur HANYA ke gambar (tidak memengaruhi mask).
-        is_check_shapes=False,  # Nonaktifkan cek bentuk ketat untuk mask multi-ukuran
+        # Nonaktifkan cek bentuk ketat untuk mask multi-ukuran.
+        is_check_shapes=False,
     )
 
+
+# ---------------------------------------------------------------------------
+# Inferensi: Deterministik (tanpa augmentasi stokastik)
+# ---------------------------------------------------------------------------
 
 def get_inference_transform(config):
     """
     Transform deterministik minimal untuk inferensi (generate_submission).
 
-    Tidak ada augmentasi stokastik — hanya resize deterministik untuk
-    memastikan input model memiliki ukuran yang benar.
+    Hanya Resize Bicubic ke resolusi training -- tidak ada stokastisitas.
     """
-    resize_dim = config.data_augmentation.supervised.resize_dim
+    image_size = int(
+        getattr(config.supervised_training, "image_size", None)
+        or getattr(config.data_augmentation.supervised, "image_size", 512)
+    )
     return A.Compose([
-        A.Resize(height=resize_dim, width=resize_dim),
+        A.Resize(
+            height=image_size,
+            width=image_size,
+            interpolation=cv2.INTER_CUBIC,
+        ),
     ])

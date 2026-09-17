@@ -36,16 +36,12 @@ data_augmentation:
   #                  atau Rotate — melanggar kiralitas magnetik filamen.
   # ─────────────────────────────────────────────────────────────────────────
   ssl:
-    # RandomResizedCrop — simulasi observasi dari jarak/sudut pandang berbeda
-    crop_size: 224          # Ukuran output crop (px). Harus ≤ ukuran NPY (512px).
-                            # Standar SimCLR: 224. Nilai aman: 224–448.
-    crop_scale: [0.2, 1.0] # Rentang area relatif crop terhadap gambar asli.
-                            # [0.2, 1.0] = 20%–100% area sumber.
-
-    # ColorJitter — simulasi variasi kecerahan instrumen GONG antar stasiun
-    color_jitter_brightness: 0.4   # Faktor perubahan kecerahan acak. Rentang: [0, 1].
-    color_jitter_contrast: 0.4     # Faktor perubahan kontras acak. Rentang: [0, 1].
-    jitter_prob: 0.8               # Probabilitas menerapkan ColorJitter per sampel.
+    # ── Augmentasi Geometris (Resize + Affine presisi rendah) ────────────────
+    # RandomResizedCrop dan ColorJitter dihapus:
+    #   - Crop acak membuang konten piringan matahari yang berguna
+    #   - ColorJitter memanipulasi fluks H-alpha secara artifisial (melanggar fisika)
+    # Ganti dengan Resize Bicubic + Affine (simulasi tracking error teleskop)
+    image_size: 512            # Ukuran output setelah Resize Bicubic (px).
 
     # GaussianBlur — simulasi smearing atmosfer (seeing)
     blur_limit_min: 3    # Ukuran kernel Gaussian minimum (harus bilangan ganjil).
@@ -64,35 +60,27 @@ data_augmentation:
   # konsistensi mask-gambar secara piksel-sempurna.
   # ─────────────────────────────────────────────────────────────────────────
   supervised:
-    # Resize — standarisasi ukuran input Mask2Former
-    resize_dim: 512         # Panjang sisi output (px). Input JPEG Kaggle: ~1024px.
-                            # Rekomendasi VRAM: 512 (aman), 768 (butuh ~12 GB), 1024 (butuh ~20 GB).
+    # ── Augmentasi Geometris (Resize + Affine presisi rendah) ────────────────
+    # Ekuivalen dengan SSL untuk menghindari scale shock antar-fase.
+    image_size: 512         # Ukuran output setelah Resize Bicubic (px).
+                            # Konsisten dengan ssl.image_size = 512.
 
-    # ShiftScaleRotate — translasi & skala saja (rotate_limit=0 menonaktifkan rotasi)
-    # Digunakan untuk mensimulasikan variasi posisi filamen dalam frame observasi.
-    shift_limit: 0.05       # Translasi maksimum (fraction gambar). 0.05 = ±5% lebar/tinggi.
-    scale_limit: 0.1        # Skala acak. 0.1 = ±10% dari ukuran asli.
-    rotate_limit: 0         # DILARANG FISIKA: set 0 untuk menonaktifkan rotasi.
-    shift_scale_prob: 0.3   # Probabilitas menerapkan ShiftScaleRotate per sampel.
+    # Affine presisi rendah — simulasi tracking error teleskop
+    # rotate=[-5,5]: rotasi ±5° mewakili drift teleskop; tidak merusak kiralitas global.
+    # ElasticTransform dan Sharpen dihapus karena Affine sudah mencakup deformasi geometris.
+    shift_limit: 0.1        # Disinkronkan dengan Affine translate_percent=0.1
+    scale_limit: 0.3        # Disinkronkan dengan Affine scale=(0.7, 1.3) = ±30%
+    rotate_limit: 5         # ±5° — simulasi tracking error (eksplisit, bukan pelanggaran kiralitas).
+    shift_scale_prob: 0.5   # Sinkron dengan p=0.5 di transforms.py
 
-    # ElasticTransform — deformasi elastis ringan, mensimulasikan distorsi atmosfer
-    elastic_alpha: 15.0     # Intensitas deformasi. Nilai besar = deformasi kuat.
-    elastic_sigma: 4.0      # Smoothness deformasi. Nilai kecil = deformasi kasar.
-    elastic_prob: 0.2       # Probabilitas per sampel. Set 0.0 untuk menonaktifkan.
-
-    # GaussNoise — konsisten dengan SSL, berlaku pada gambar+mask sekaligus
+    # GaussNoise — konsisten dengan SSL
     gauss_noise_var_limit: [0.001, 0.005]  # Lebih konservatif dari SSL.
     gauss_noise_prob: 0.2
 
-    # GaussianBlur — simulasi smearing untuk supervised (lebih ringan dari SSL)
+    # GaussianBlur — simulasi smearing (lebih ringan dari SSL)
     blur_limit_min: 3
     blur_limit_max: 5
     blur_prob: 0.2
-
-    # Sharpen — menonjolkan tepi filamen (berlawanan dengan blur)
-    # Digunakan bergantian dengan blur untuk melatih model pada gambar tajam dan blur.
-    sharpen_alpha: [0.1, 0.3]  # Kekuatan sharpening. [min, max].
-    sharpen_prob: 0.15
 
   # ─────────────────────────────────────────────────────────────────────────
   # Spine Rendering — parameter render mask sumbu filamen (Kelas 1)
@@ -126,6 +114,7 @@ ssl_training:
   temperature: 0.07     # ← Diturunkan dari 0.1. Nilai paper asli SimCLR (Chen et al., 2020).
                         #   Temperature rendah → distribusi softmax lebih peaked → gradien lebih kuat.
   warmup_epochs: 10     # ← Epoch warmup LR linear sebelum CosineAnnealingLR aktif (sesuai sthalles).
+  image_size: 512       # ← Resolusi input backbone SSL. Resize Bicubic ke 512×512.
   log_every_n_steps: 10
 
 
@@ -137,3 +126,5 @@ supervised_training:
   log_every_n_steps: 10
   # Epoch pembekuan backbone sebelum full fine-tuning (Fix BUG-05)
   freeze_backbone_epochs: 5
+  image_size: 512       # ← Resolusi input backbone Supervised. Resize Bicubic ke 512×512.
+                        #   Konsisten dengan ssl_training.image_size = 512.
