@@ -21,7 +21,7 @@ except ImportError:
     from dataloaders.dataset_ssl import SolarSSLDataset
 
 
-def train_simclr_routine(config):
+def train_simclr_routine(config, resume_path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Starting SimCLR routine on device: {device}")
 
@@ -159,7 +159,43 @@ def train_simclr_routine(config):
     # Counter global untuk log TensorBoard per iterasi
     global_step = 0
 
-    for epoch in range(1, config.ssl_training.epochs + 1):
+    # ── Resume from Checkpoint ────────────────────────────────────────────────
+    # Logika deteksi path:
+    #   resume_path == None   → mulai dari awal (default)
+    #   resume_path == 'auto' → cari 'checkpoint_last_simclr.pt' di weights_dir
+    #   resume_path == <path> → muat dari path eksplisit yang diberikan
+    start_epoch = 1
+    ckpt_last_path = os.path.join(config.system.weights_dir, "checkpoint_last_simclr.pt")
+
+    if resume_path is not None:
+        if resume_path == "auto":
+            load_path = ckpt_last_path
+        else:
+            load_path = resume_path
+
+        if os.path.exists(load_path):
+            print(f"[INFO] Memuat checkpoint SimCLR dari: '{load_path}'")
+            ckpt = torch.load(load_path, map_location=device)
+
+            model.load_state_dict(ckpt["model_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            if scaler is not None and "scaler_state_dict" in ckpt:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            start_epoch  = ckpt["epoch"] + 1   # lanjut dari epoch BERIKUTNYA
+            global_step  = ckpt.get("global_step", 0)
+
+            print(
+                f"[INFO] Resume OK — melanjutkan dari Epoch {start_epoch}/{config.ssl_training.epochs} "
+                f"| global_step={global_step}"
+            )
+        else:
+            print(
+                f"[WARN] --resume diberikan tetapi checkpoint tidak ditemukan di '{load_path}'. "
+                f"Memulai dari awal."
+            )
+
+    for epoch in range(start_epoch, config.ssl_training.epochs + 1):
         # ── Warmup LR Linear ─────────────────────────────────────────────────
         # Selama WARMUP_EPOCHS pertama, naikkan LR secara linear: 0 → base_lr.
         # Setelah warmup, CosineAnnealingLR mengambil alih (di-step per epoch).
@@ -225,10 +261,24 @@ def train_simclr_routine(config):
         if epoch > WARMUP_EPOCHS:
             scheduler.step()
 
-        checkpoint_path = os.path.join(
-            config.system.weights_dir, f"simclr_epoch_{epoch}.pth"
+        # ── Simpan Checkpoint Lengkap ─────────────────────────────────────────
+        # Checkpoint per-epoch (bernomor) untuk recovery manual.
+        # checkpoint_last_simclr.pt selalu merupakan checkpoint TERBARU
+        # dan digunakan oleh --resume auto.
+        ckpt_dict = {
+            "epoch":                epoch,
+            "global_step":          global_step,
+            "model_state_dict":     model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict":    scaler.state_dict() if scaler is not None else None,
+            "config_ssl_training":  dict(config.ssl_training),
+        }
+        epoch_ckpt_path = os.path.join(
+            config.system.weights_dir, f"simclr_epoch_{epoch}.pt"
         )
-        torch.save(model.state_dict(), checkpoint_path)
+        torch.save(ckpt_dict, epoch_ckpt_path)
+        torch.save(ckpt_dict, ckpt_last_path)   # overwrite alias terbaru
 
     # Tutup TensorBoard writer sebelum exit
     writer.close()

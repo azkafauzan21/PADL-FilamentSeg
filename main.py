@@ -111,6 +111,25 @@ def parse_args():
         ),
     )
 
+    # ------------------------------------------------------------------
+    # Optional: resume from checkpoint
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        nargs="?",
+        const="auto",
+        metavar="PATH",
+        help=(
+            "Lanjutkan training dari checkpoint terakhir.\n"
+            "  --resume          → cari otomatis 'checkpoint_last_simclr.pt' /\n"
+            "                      'checkpoint_last_mask2former.pt' di weights_dir\n"
+            "  --resume PATH     → muat checkpoint dari PATH yang ditentukan secara eksplisit\n"
+            "(Default: None — mulai training dari awal)"
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -170,6 +189,13 @@ def apply_overrides(config, args):
     else:
         print("[INFO] Tidak ada CLI override. Menggunakan seluruh nilai dari config.yaml.")
 
+    # Laporan flag --resume (informatif, tidak mengubah config)
+    if hasattr(args, 'resume') and args.resume is not None:
+        if args.resume == "auto":
+            print("[INFO] --resume: Deteksi otomatis checkpoint terakhir diaktifkan.")
+        else:
+            print(f"[INFO] --resume: Muat dari path eksplisit → '{args.resume}'")
+
     return config
 
 
@@ -210,9 +236,9 @@ def main():
     elif args.mode == "preprocess":
         preprocess_routine(config)
     elif args.mode == "train_simclr":
-        train_simclr_routine(config)
+        train_simclr_routine(config, resume_path=args.resume)
     elif args.mode == "train_mask2former":
-        train_mask2former_routine(config)
+        train_mask2former_routine(config, resume_path=args.resume)
     elif args.mode == "generate_submission":
         inference_routine(config)
     else:

@@ -213,7 +213,7 @@ def run_validation(
 # Main Training Routine
 # ---------------------------------------------------------------------------
 
-def train_mask2former_routine(config):
+def train_mask2former_routine(config, resume_path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Starting Mask2Former supervised routine on device: {device}")
 
@@ -321,6 +321,55 @@ def train_mask2former_routine(config):
     if scaler:
         print("[INFO] Automatic Mixed Precision (AMP - fp16) ENABLED.")
 
+    # ── Resume from Checkpoint ────────────────────────────────────────────────
+    # Logika deteksi path:
+    #   resume_path == None   → mulai dari awal (default)
+    #   resume_path == 'auto' → cari 'checkpoint_last_mask2former.pt' di weights_dir
+    #   resume_path == <path> → muat dari path eksplisit yang diberikan
+    _resume_start_epoch = 1
+    _resume_best_pq     = -1.0
+    _resume_global_step = 0
+    _resume_phase       = "frozen"   # fase backbone saat checkpoint disimpan
+    ckpt_last_path = os.path.join(config.system.weights_dir, "checkpoint_last_mask2former.pt")
+
+    if resume_path is not None:
+        if resume_path == "auto":
+            load_path = ckpt_last_path
+        else:
+            load_path = resume_path
+
+        if os.path.exists(load_path):
+            print(f"[INFO] Memuat checkpoint Mask2Former dari: '{load_path}'")
+            ckpt = torch.load(load_path, map_location=device)
+
+            model.load_state_dict(ckpt["model_state_dict"])
+
+            # Pulihkan fase backbone (frozen/unfrozen) sebelum load optimizer
+            _resume_phase = ckpt.get("phase", "frozen")
+            if _resume_phase == "unfrozen":
+                set_backbone_grad(requires_grad=True)
+                optimizer = make_optimizer(phase="unfrozen")
+            # Jika frozen, optimizer sudah dibuat di atas — cukup load state-nya
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
+            if scaler is not None and "scaler_state_dict" in ckpt and ckpt["scaler_state_dict"] is not None:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+
+            _resume_start_epoch = ckpt["epoch"] + 1
+            _resume_best_pq     = ckpt.get("best_pq", -1.0)
+            _resume_global_step = ckpt.get("global_step", 0)
+
+            print(
+                f"[INFO] Resume OK — melanjutkan dari Epoch {_resume_start_epoch}/{config.supervised_training.epochs} "
+                f"| best_pq={_resume_best_pq:.4f} | phase={_resume_phase} | global_step={_resume_global_step}"
+            )
+        else:
+            print(
+                f"[WARN] --resume diberikan tetapi checkpoint tidak ditemukan di '{load_path}'. "
+                f"Memulai dari awal."
+            )
+
+
     # ------------------------------------------------------------------
     # Torchmetrics: DiceScore
     # ------------------------------------------------------------------
@@ -422,13 +471,13 @@ def train_mask2former_routine(config):
     # ------------------------------------------------------------------
     # Smart Checkpointing: simpan best_mask2former.pth hanya jika PQ naik
     # ------------------------------------------------------------------
-    best_pq: float = -1.0
-    best_checkpoint_path = os.path.join(config.system.weights_dir, "best_mask2former.pth")
+    best_pq: float = _resume_best_pq
+    best_checkpoint_path = os.path.join(config.system.weights_dir, "best_mask2former.pt")
 
     # Counter global untuk log TensorBoard per iterasi
-    global_step = 0
+    global_step = _resume_global_step
 
-    for epoch in range(1, config.supervised_training.epochs + 1):
+    for epoch in range(_resume_start_epoch, config.supervised_training.epochs + 1):
         # ------------------------------------------------------------------
         # Transisi Fase 1 → Fase 2: Cairkan backbone setelah FREEZE_EPOCHS
         # ------------------------------------------------------------------
@@ -516,12 +565,19 @@ def train_mask2former_routine(config):
                 f"  [Val] Epoch {epoch}: Dice={avg_dice:.4f} | PQ={avg_pq:.4f}"
             )
 
-            # ------------------------------------------------------------------
-            # Smart Checkpointing: simpan jika PQ memecahkan rekor
-            # ------------------------------------------------------------------
+            # ── Simpan best checkpoint (lengkap) jika PQ memecahkan rekor ──
             if avg_pq > best_pq:
                 best_pq = avg_pq
-                torch.save(model.state_dict(), best_checkpoint_path)
+                best_ckpt = {
+                    "epoch":                epoch,
+                    "global_step":          global_step,
+                    "best_pq":              best_pq,
+                    "phase":                "unfrozen" if epoch > FREEZE_EPOCHS else "frozen",
+                    "model_state_dict":     model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict":    scaler.state_dict() if scaler is not None else None,
+                }
+                torch.save(best_ckpt, best_checkpoint_path)
                 print(
                     f"  [CKPT] ✅ Rekor PQ baru: {avg_pq:.4f}. "
                     f"Disimpan ke '{best_checkpoint_path}'"
@@ -532,11 +588,24 @@ def train_mask2former_routine(config):
                     "Checkpoint tidak diperbarui."
                 )
 
-        # Checkpoint epoch biasa
-        checkpoint_path = os.path.join(
-            config.system.weights_dir, f"mask2former_epoch_{epoch}.pth"
+        # ── Simpan Checkpoint Lengkap per Epoch ─────────────────────────────────
+        # checkpoint_last_mask2former.pt selalu merupakan checkpoint TERBARU
+        # dan digunakan oleh --resume auto.
+        current_phase = "unfrozen" if epoch >= FREEZE_EPOCHS + 1 else "frozen"
+        ckpt_dict = {
+            "epoch":                epoch,
+            "global_step":          global_step,
+            "best_pq":              best_pq,
+            "phase":                current_phase,
+            "model_state_dict":     model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict":    scaler.state_dict() if scaler is not None else None,
+        }
+        epoch_ckpt_path = os.path.join(
+            config.system.weights_dir, f"mask2former_epoch_{epoch}.pt"
         )
-        torch.save(model.state_dict(), checkpoint_path)
+        torch.save(ckpt_dict, epoch_ckpt_path)
+        torch.save(ckpt_dict, ckpt_last_path)   # overwrite alias terbaru
 
     # Tutup TensorBoard writer
     writer.close()
